@@ -109,25 +109,31 @@ final class RemoveBlueGreenApplicationContainers
             'set -eu',
             'umask 077',
             'attempt_deadline=$(($(date +%s) + '.(string) BlueGreenProxyDeactivationSnapshot::DRAIN_ATTEMPT_SECONDS.'))',
-            ...$this->commandsForFixedContainer(
+        ];
+        $replicaNames = array_column($plan->replicaContainers, 'name');
+        if (! in_array($plan->blueContainerName, $replicaNames, true)) {
+            array_push($commands, ...$this->commandsForFixedContainer(
                 $plan,
                 $plan->blueContainerName,
                 BlueGreenDeploymentColor::BLUE,
                 $plan->blueRoutingRevision,
-            ),
-            ...$this->commandsForFixedContainer(
+            ));
+        }
+        if (! in_array($plan->greenContainerName, $replicaNames, true)) {
+            array_push($commands, ...$this->commandsForFixedContainer(
                 $plan,
                 $plan->greenContainerName,
                 BlueGreenDeploymentColor::GREEN,
                 $plan->greenRoutingRevision,
-            ),
-        ];
+            ));
+        }
         foreach ($plan->replicaContainers as $replica) {
             array_push($commands, ...$this->commandsForReplica($plan, $replica));
         }
         if ($plan->legacyContainerName !== null) {
             array_push($commands, ...$this->commandsForLegacyContainer($plan));
         }
+        array_push($commands, ...$this->commandsForApplicationLabelScope($plan));
 
         return implode("\n", $commands);
     }
@@ -146,22 +152,136 @@ final class RemoveBlueGreenApplicationContainers
                 static fn (string $containerName): string => '! docker container inspect '.escapeshellarg($containerName).' >/dev/null 2>&1',
                 $containerNames,
             ),
+            ...$this->applicationLabelScopeAbsenceAssertions($plan),
         ]);
     }
 
-    /** @param array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int} $replica */
+    /** @return list<string> */
+    private function commandsForApplicationLabelScope(BlueGreenContainerRemovalPlan $plan): array
+    {
+        $expectedProductionMetadata = escapeshellarg("{$plan->applicationId} true 0 application");
+
+        return [
+            ...$this->applicationLabelScopeDiscovery($plan),
+            'expected_preview_prefix='.escapeshellarg("{$plan->applicationId} true "),
+            'expected_preview_suffix='.escapeshellarg(' application'),
+            'planned_container_names='.escapeshellarg(implode(' ', $this->plannedContainerNames($plan))),
+            'for container_id in $application_container_ids; do',
+            '  inspection=$(docker inspect --format='.escapeshellarg('{{.Id}} {{.Name}} {{index .Config.Labels "coolify.applicationId"}} {{index .Config.Labels "coolify.managed"}} {{index .Config.Labels "coolify.pullRequestId"}} {{index .Config.Labels "coolify.type"}}').' "$container_id")',
+            '  inspected_container_id=${inspection%% *}',
+            '  remainder=${inspection#* }',
+            '  container_name=${remainder%% *}',
+            '  metadata=${remainder#* }',
+            '  test "$inspected_container_id" = "$container_id"',
+            '  test "${#container_id}" -eq 64',
+            '  case "$container_id" in *[!0-9a-f]*|\'\') exit 1 ;; esac',
+            '  case " $planned_container_names " in *" $container_name "*) exit 1 ;; esac',
+            '  if [ "$metadata" = '.$expectedProductionMetadata.' ]; then',
+            '    remaining_attempt=$((attempt_deadline - $(date +%s)))',
+            '    if [ "$remaining_attempt" -le 0 ]; then printf \'%s\n\' \'This bounded removal attempt ended before label-scoped cleanup; resume the same operation.\' >&2; exit 75; fi',
+            '    stop_timeout='.(string) max(1, $plan->stopGracePeriodSeconds),
+            '    if [ "$stop_timeout" -gt "$remaining_attempt" ]; then stop_timeout=$remaining_attempt; fi',
+            '    docker stop --time="$stop_timeout" "$container_id" >/dev/null 2>&1 || true',
+            '    docker rm -f "$container_id" >/dev/null',
+            '    ! docker container inspect "$container_id" >/dev/null 2>&1',
+            '    continue',
+            '  fi',
+            ...$this->validPreviewAssertions(2),
+            'done',
+            ...$this->applicationLabelScopeAbsenceAssertions($plan),
+        ];
+    }
+
+    /** @return list<string> */
+    private function applicationLabelScopeDiscovery(BlueGreenContainerRemovalPlan $plan): array
+    {
+        return [
+            'application_container_ids=$(docker ps -aq --no-trunc --filter '.escapeshellarg("label=coolify.applicationId={$plan->applicationId}").')',
+        ];
+    }
+
+    /** @return list<string> */
+    private function applicationLabelScopeAbsenceAssertions(BlueGreenContainerRemovalPlan $plan): array
+    {
+        $expectedProductionMetadata = escapeshellarg("{$plan->applicationId} true 0 application");
+
+        return [
+            ...$this->applicationLabelScopeDiscovery($plan),
+            'expected_preview_prefix='.escapeshellarg("{$plan->applicationId} true "),
+            'expected_preview_suffix='.escapeshellarg(' application'),
+            'planned_container_names='.escapeshellarg(implode(' ', $this->plannedContainerNames($plan))),
+            'for container_id in $application_container_ids; do',
+            '  inspection=$(docker inspect --format='.escapeshellarg('{{.Name}} {{index .Config.Labels "coolify.applicationId"}} {{index .Config.Labels "coolify.managed"}} {{index .Config.Labels "coolify.pullRequestId"}} {{index .Config.Labels "coolify.type"}}').' "$container_id")',
+            '  container_name=${inspection%% *}',
+            '  metadata=${inspection#* }',
+            '  case " $planned_container_names " in *" $container_name "*) exit 1 ;; esac',
+            '  test "$metadata" != '.$expectedProductionMetadata,
+            ...$this->validPreviewAssertions(2),
+            'done',
+        ];
+    }
+
+    /** @return list<string> */
+    private function validPreviewAssertions(int $spaces): array
+    {
+        $indent = str_repeat(' ', $spaces);
+
+        return [
+            $indent.'case "$metadata" in "$expected_preview_prefix"*"$expected_preview_suffix") ;; *) exit 1 ;; esac',
+            $indent.'pull_request_id=${metadata#"$expected_preview_prefix"}',
+            $indent.'pull_request_id=${pull_request_id%"$expected_preview_suffix"}',
+            $indent.'case "$pull_request_id" in *[!0-9]*|\'\') exit 1 ;; esac',
+            $indent.'test "$pull_request_id" -gt 0',
+        ];
+    }
+
+    /** @return list<string> */
+    private function plannedContainerNames(BlueGreenContainerRemovalPlan $plan): array
+    {
+        $names = ["/{$plan->blueContainerName}", "/{$plan->greenContainerName}"];
+        foreach ($plan->replicaContainers as $replica) {
+            $names[] = "/{$replica['name']}";
+        }
+        if ($plan->legacyContainerName !== null) {
+            $names[] = "/{$plan->legacyContainerName}";
+        }
+
+        return $names;
+    }
+
+    /** @param array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int, count: int, composeProject: string, composeService: string, ordinal: int} $replica */
     private function commandsForReplica(BlueGreenContainerRemovalPlan $plan, array $replica): array
     {
+        [$format, $expectedMetadata] = $this->replicaInspection($plan, $replica);
+
         return $this->commandsForExactContainer(
             containerName: $replica['name'],
-            format: '{{.Id}} {{.Name}} {{index .Config.Labels "coolify.applicationId"}} {{index .Config.Labels "coolify.blueGreen.managed"}} {{index .Config.Labels "coolify.blueGreen.deploymentUuid"}} {{index .Config.Labels "coolify.blueGreen.color"}} {{index .Config.Labels "coolify.blueGreen.routingRevision"}} {{index .Config.Labels "coolify.blueGreen.replicaIndex"}}',
-            expectedMetadata: "/{$replica['name']} {$plan->applicationId} true {$replica['deploymentUuid']} {$replica['color']->value} {$replica['routingRevision']} {$replica['index']}",
+            format: $format,
+            expectedMetadata: $expectedMetadata,
             stopGracePeriodSeconds: $plan->stopGracePeriodSeconds,
             expectedContainerId: $replica['id'],
         );
     }
 
-    /** @return list<array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int}> */
+    /**
+     * @param  array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int, count: int, composeProject: string, composeService: string, ordinal: int}  $replica
+     * @return array{string, string}
+     */
+    private function replicaInspection(BlueGreenContainerRemovalPlan $plan, array $replica): array
+    {
+        $format = '{{.Id}} {{.Name}} {{index .Config.Labels "coolify.applicationId"}} {{index .Config.Labels "coolify.pullRequestId"}} {{index .Config.Labels "coolify.blueGreen.managed"}} {{index .Config.Labels "coolify.blueGreen.deploymentUuid"}} {{index .Config.Labels "coolify.blueGreen.color"}} {{index .Config.Labels "coolify.blueGreen.routingRevision"}}';
+        $expected = "/{$replica['name']} {$plan->applicationId} 0 true {$replica['deploymentUuid']} {$replica['color']->value} {$replica['routingRevision']}";
+        if ($replica['count'] > 1) {
+            $format .= ' {{index .Config.Labels "coolify.blueGreen.replicaIndex"}} {{index .Config.Labels "coolify.blueGreen.replicaCount"}}';
+            $expected .= " {$replica['index']} {$replica['count']}";
+        }
+        $format .= ' {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.service"}}';
+        $expected .= " {$replica['composeProject']} {$replica['composeService']}";
+
+        return [$format, $expected];
+    }
+
+    /** @return list<array{name: string, id: string, color: BlueGreenDeploymentColor, routingRevision: int, deploymentUuid: string, index: int, count: int, composeProject: string, composeService: string, ordinal: int}> */
     private function replicaContainers(ApplicationBlueGreenDeployment $state): array
     {
         $deploymentUuids = array_values(array_filter([
@@ -181,9 +301,19 @@ final class RemoveBlueGreenApplicationContainers
             return [];
         }
 
-        return $rows->map(function (ApplicationBlueGreenReplica $replica): array {
+        $replicaCounts = $rows->groupBy('deployment_uuid')->map(
+            static fn (Collection $deploymentReplicas): int => (int) $deploymentReplicas->max('replica_index'),
+        );
+
+        return $rows->values()->map(function (ApplicationBlueGreenReplica $replica, int $ordinal) use ($replicaCounts): array {
             if ($replica->container_name === null || $replica->container_id === null) {
                 throw new BlueGreenDeactivationException('A durable blue-green replica has no exact bound container identity.');
+            }
+            if (! is_string($replica->compose_project)
+                || trim($replica->compose_project) === ''
+                || ! is_string($replica->compose_service)
+                || trim($replica->compose_service) === '') {
+                throw new BlueGreenDeactivationException('A durable blue-green replica has incomplete Compose provenance.');
             }
 
             return [
@@ -193,6 +323,10 @@ final class RemoveBlueGreenApplicationContainers
                 'routingRevision' => $replica->routing_revision,
                 'deploymentUuid' => $replica->deployment_uuid,
                 'index' => $replica->replica_index,
+                'count' => $replicaCounts->get($replica->deployment_uuid),
+                'composeProject' => $replica->compose_project,
+                'composeService' => $replica->compose_service,
+                'ordinal' => $ordinal,
             ];
         })->all();
     }

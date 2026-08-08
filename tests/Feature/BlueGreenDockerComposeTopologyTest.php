@@ -18,6 +18,7 @@ use App\Actions\Proxy\BlueGreenRoutingTarget;
 use App\Actions\Proxy\CompileBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentExecutionPhase;
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
@@ -1846,6 +1847,48 @@ it('carries the fixed Compose sidecar removal plan into deletion preparation', f
         ->and($preparation->composeSidecarRemovalPlan->sidecars)->toHaveCount(2)
         ->and($preparation->composeSidecarRemovalPlan->sidecars[0]->serviceName)->toBe('db')
         ->and($preparation->composeSidecarRemovalPlan->sidecars[1]->serviceName)->toBe('worker');
+});
+
+it('allows Compose topology to change after an exact stopped and empty proof', function (): void {
+    ['application' => $application, 'destination' => $destination] = BlueGreenDeactivationScenario::context();
+    $application->forceFill([
+        'build_pack' => 'dockercompose',
+        'health_check_enabled' => true,
+        'health_check_path' => '/health',
+        'compose_parsing_version' => '3',
+        'docker_compose' => Yaml::dump(blueGreenComposeFixtureDocument(), 10),
+        'docker_compose_domains' => json_encode(['web' => ['domain' => 'https://compose.example.test']]),
+        'docker_compose_raw' => Yaml::dump(blueGreenComposeRawFixtureDocument(blueGreenComposeFixtureDocument()), 10),
+        'docker_compose_custom_build_command' => null,
+        'docker_compose_custom_start_command' => null,
+    ])->save();
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('d', 64);
+    $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $destination->id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 2,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('e', 64),
+        'application_routing_config_digest' => str_repeat('f', 64),
+    ]);
+    $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $destination->id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 2,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+    expect($application->blueGreenPinnedComposeContainerNames())->toBe([]);
+    $renamedDocument = blueGreenComposeFixtureDocument();
+    $renamedDocument['services']['worker']['container_name'] = 'renamed-worker-after-stop';
+    $application->forceFill(['docker_compose' => Yaml::dump($renamedDocument, 10)]);
+
+    expect($application->save())->toBeTrue()
+        ->and($application->fresh()->docker_compose)->toContain('renamed-worker-after-stop');
 });
 
 it('runs each fixed Compose sidecar removal and absence attestation before completing deletion', function (): void {

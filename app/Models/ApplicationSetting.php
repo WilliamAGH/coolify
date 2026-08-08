@@ -3,7 +3,6 @@
 namespace App\Models;
 
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
-use App\Enums\BlueGreenDeploymentPhase;
 use App\Exceptions\BlueGreenAdmissionException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
@@ -220,17 +219,15 @@ class ApplicationSetting extends Model
             if ($isOptingOut) {
                 $application->consumeBlueGreenManualStopProofsForOptOut($states, $deactivations);
                 $states = collect();
-            }
-
-            if ($states->contains(
-                static fn (ApplicationBlueGreenDeployment $state): bool => $state->phase !== BlueGreenDeploymentPhase::IDLE,
-            )) {
-                throw new BlueGreenAdmissionException('Blue-green routing and lifecycle settings cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
+                $deactivations = collect();
             }
 
             $application->setRelation('settings', $this);
             $this->setRelation('application', $application);
-            $application->assertBlueGreenTopologyMutationAllowed();
+            $application->assertBlueGreenTopologyMutationAllowed(
+                states: $states,
+                deactivations: $deactivations,
+            );
             $this->prepareBlueGreenMutation();
 
             return parent::performUpdate($query);

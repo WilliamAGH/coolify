@@ -42,6 +42,8 @@ final readonly class BlueGreenContainerRemovalPlan
                 throw new InvalidArgumentException('A tracked blue-green container must have a positive routing revision.');
             }
         }
+        $replicaOrdinals = [];
+        $replicaNames = [];
         foreach ($this->replicaContainers as $replica) {
             if (! is_array($replica)
                 || ! is_string($replica['name'] ?? null)
@@ -50,10 +52,23 @@ final readonly class BlueGreenContainerRemovalPlan
                 || ! ($replica['color'] ?? null) instanceof BlueGreenDeploymentColor
                 || ! is_int($replica['routingRevision'] ?? null)
                 || ! is_string($replica['deploymentUuid'] ?? null)
-                || ! is_int($replica['index'] ?? null)) {
+                || ! is_int($replica['index'] ?? null)
+                || ! is_int($replica['count'] ?? null)
+                || $replica['index'] < 1
+                || $replica['count'] < $replica['index']
+                || ! is_string($replica['composeProject'] ?? null)
+                || trim($replica['composeProject']) === ''
+                || ! is_string($replica['composeService'] ?? null)
+                || trim($replica['composeService']) === ''
+                || ! is_int($replica['ordinal'] ?? null)
+                || $replica['ordinal'] < 0
+                || isset($replicaOrdinals[$replica['ordinal']])
+                || isset($replicaNames[$replica['name']])) {
                 throw new InvalidArgumentException('A blue-green replica removal entry requires complete immutable provenance.');
             }
             $this->assertContainerName($replica['name']);
+            $replicaOrdinals[$replica['ordinal']] = true;
+            $replicaNames[$replica['name']] = true;
         }
     }
 

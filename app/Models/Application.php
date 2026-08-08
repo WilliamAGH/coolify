@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use App\Actions\Application\BlueGreen\BlueGreenTopologyLock;
+use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Proxy\RemoveProxyConnectedNetwork;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeactivationPhase;
@@ -431,7 +432,7 @@ class Application extends BaseModel
                 ->orderBy('id')
                 ->lockForUpdate()
                 ->get();
-            ApplicationBlueGreenDeactivation::query()
+            $deactivations = ApplicationBlueGreenDeactivation::query()
                 ->where('application_id', $application->id)
                 ->orderBy('id')
                 ->lockForUpdate()
@@ -458,16 +459,13 @@ class Application extends BaseModel
                     ->get();
             }
 
-            if ($states->contains(
-                static fn (ApplicationBlueGreenDeployment $state): bool => $state->phase !== BlueGreenDeploymentPhase::IDLE,
-            )) {
-                throw new RuntimeException('Blue-green routing and health configuration cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
-            }
-
             if ($setting !== null) {
                 $this->setRelation('settings', $setting);
             }
-            $this->assertBlueGreenTopologyMutationAllowed();
+            $this->assertBlueGreenTopologyMutationAllowed(
+                states: $states,
+                deactivations: $deactivations,
+            );
             if ($this->hasBlueGreenEligibilityAffectingChanges()) {
                 $this->prepareBlueGreenConfigurationMutation($setting);
             }
@@ -1677,7 +1675,7 @@ class Application extends BaseModel
         if (! $this->isBlueGreenDeploymentOptedIn($setting) && ! $hasDurableState) {
             return;
         }
-        if ($hasDurableState) {
+        if ($hasDurableState && ! $this->hasBlueGreenMutableStoppedTopology()) {
             $this->assertBlueGreenComposeSidecarIdentitiesUnchanged();
         }
         if ($hasDurableState && ($topologyReason = $this->blueGreenDurableStateTopologyIneligibilityReason()) !== null) {
@@ -1708,7 +1706,9 @@ class Application extends BaseModel
      */
     public function blueGreenPinnedComposeContainerNames(): array
     {
-        if ($this->build_pack !== 'dockercompose' || ! $this->hasBlueGreenDurableState()) {
+        if ($this->build_pack !== 'dockercompose'
+            || ! $this->hasBlueGreenDurableState()
+            || $this->hasBlueGreenMutableStoppedTopology()) {
             return [];
         }
         $persistedApplication = clone $this;
@@ -2006,19 +2006,178 @@ class Application extends BaseModel
         return $deploymentQuery->exists() || $deactivationQuery->exists();
     }
 
-    public function assertBlueGreenTopologyMutationAllowed(?int $standaloneDockerId = null): void
-    {
+    /**
+     * @param  Collection<int, ApplicationBlueGreenDeployment>|null  $states
+     * @param  Collection<int, ApplicationBlueGreenDeactivation>|null  $deactivations
+     */
+    public function assertBlueGreenTopologyMutationAllowed(
+        ?int $standaloneDockerId = null,
+        ?Collection $states = null,
+        ?Collection $deactivations = null,
+    ): void {
         if ($this->trashed()) {
             throw new BlueGreenAdmissionException('Blue-green application topology cannot change after the application is soft-deleted. Finish or recover strict deactivation first.');
         }
 
-        $deactivationQuery = $this->blueGreenDeactivations();
-        if ($standaloneDockerId !== null) {
-            $deactivationQuery->where('standalone_docker_id', $standaloneDockerId);
+        $states ??= $this->blueGreenDeployments()
+            ->when(
+                $standaloneDockerId !== null,
+                static fn (Builder $query): Builder => $query->where('standalone_docker_id', $standaloneDockerId),
+            )
+            ->get();
+        $deactivations ??= $this->blueGreenDeactivations()
+            ->when(
+                $standaloneDockerId !== null,
+                static fn (Builder $query): Builder => $query->where('standalone_docker_id', $standaloneDockerId),
+            )
+            ->get();
+        if ($deactivations->isEmpty()
+            && $states->every(
+                static fn (ApplicationBlueGreenDeployment $state): bool => $state->phase === BlueGreenDeploymentPhase::IDLE,
+            )) {
+            return;
         }
-        if ($deactivationQuery->exists()) {
+        if ($states->contains(
+            static fn (ApplicationBlueGreenDeployment $state): bool => ! in_array(
+                $state->phase,
+                [BlueGreenDeploymentPhase::IDLE, BlueGreenDeploymentPhase::STOPPED],
+                true,
+            ),
+        )) {
+            throw new BlueGreenAdmissionException('Blue-green routing and health configuration cannot change while a deployment operation is in progress. Wait for promotion or recovery to finish.');
+        }
+        if ($states->isEmpty() && $deactivations->isNotEmpty()) {
             throw new BlueGreenAdmissionException('Blue-green application topology cannot change while durable deactivation state exists. Finish or recover the strict deactivation lifecycle first.');
         }
+        $stoppedDestinationIds = $this->blueGreenStoppedTopologyDestinationIds(
+            $states,
+            $deactivations,
+            $standaloneDockerId,
+        );
+        if ($stoppedDestinationIds === null) {
+            throw new BlueGreenAdmissionException('Blue-green application topology cannot change because every destination requires an exact completed stopped proof.');
+        }
+        if ($stoppedDestinationIds->isNotEmpty()
+            && ApplicationDeploymentQueue::query()
+                ->where('application_id', $this->id)
+                ->whereIn('destination_id', $stoppedDestinationIds)
+                ->whereIn('status', [
+                    ApplicationDeploymentStatus::QUEUED->value,
+                    ApplicationDeploymentStatus::IN_PROGRESS->value,
+                ])
+                ->exists()) {
+            throw new BlueGreenAdmissionException('Blue-green application topology cannot change while a deployment owns a stopped destination.');
+        }
+    }
+
+    private function blueGreenStateIsRouteEmpty(ApplicationBlueGreenDeployment $state): bool
+    {
+        if (! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)
+            || $state->active_color !== null
+            || $state->blue_deployment_uuid !== null
+            || $state->green_deployment_uuid !== null
+            || $state->legacy_container_name !== null
+            || $state->managed_file_sha256 !== null
+            || $state->intervention_phase !== null
+            || $state->intervention_reason !== null
+            || $state->inactive_retirement_owner_deployment_uuid !== null
+            || $state->inactive_retirement_deployment_uuid !== null) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private function blueGreenManualStopProofMatches(
+        ApplicationBlueGreenDeployment $state,
+        ApplicationBlueGreenDeactivation $deactivation,
+    ): bool {
+        try {
+            $deactivation->assertValid();
+        } catch (\LogicException) {
+            return false;
+        }
+
+        return $state->phase === BlueGreenDeploymentPhase::STOPPED
+            && $deactivation->phase === BlueGreenDeactivationPhase::STOPPED
+            && $deactivation->ownsApplicationLifecycle($this)
+            && (int) $state->supersession_generation === (int) $deactivation->supersession_generation
+            && $state->destination_fence_operation_id === $deactivation->operation_id
+            && $state->destination_fence_mutation_sequence >= 1
+            && is_string($state->destination_topology_digest)
+            && preg_match('/^[0-9a-f]{64}$/D', $state->destination_topology_digest) === 1
+            && is_string($state->application_routing_config_digest)
+            && preg_match('/^[0-9a-f]{64}$/D', $state->application_routing_config_digest) === 1
+            && $deactivation->intervention_phase === null
+            && $deactivation->intervention_reason === null;
+    }
+
+    private function hasBlueGreenMutableStoppedTopology(): bool
+    {
+        $states = $this->blueGreenDeployments()->get();
+        if ($states->isEmpty()) {
+            return false;
+        }
+        $deactivations = $this->blueGreenDeactivations()->get();
+        $stoppedDestinationIds = $this->blueGreenStoppedTopologyDestinationIds($states, $deactivations);
+        if ($stoppedDestinationIds === null) {
+            return false;
+        }
+
+        return ! ApplicationDeploymentQueue::query()
+            ->where('application_id', $this->id)
+            ->whereIn('destination_id', $stoppedDestinationIds)
+            ->whereIn('status', [
+                ApplicationDeploymentStatus::QUEUED->value,
+                ApplicationDeploymentStatus::IN_PROGRESS->value,
+            ])
+            ->exists();
+    }
+
+    /**
+     * @param  Collection<int, ApplicationBlueGreenDeployment>  $states
+     * @param  Collection<int, ApplicationBlueGreenDeactivation>  $deactivations
+     * @return Collection<int, int>|null
+     */
+    private function blueGreenStoppedTopologyDestinationIds(
+        Collection $states,
+        Collection $deactivations,
+        ?int $standaloneDockerId = null,
+    ): ?Collection {
+        if ($states->isEmpty() || $deactivations->isEmpty()) {
+            return null;
+        }
+        $statesByDestination = $states->keyBy('standalone_docker_id');
+        $deactivationsByDestination = $deactivations->keyBy('standalone_docker_id');
+        $expectedDestinationIds = $standaloneDockerId === null
+            ? $this->blueGreenConfiguredStandaloneDockerDestinationIds()
+                ->merge($states->pluck('standalone_docker_id'))
+                ->merge($deactivations->pluck('standalone_docker_id'))
+            : collect([$standaloneDockerId]);
+        $expectedDestinationIds = $expectedDestinationIds
+            ->map(static fn (mixed $destinationId): int => (int) $destinationId)
+            ->unique()
+            ->sort()
+            ->values();
+        $stateDestinationIds = $statesByDestination->keys()->map(static fn (mixed $id): int => (int) $id)->sort()->values();
+        $deactivationDestinationIds = $deactivationsByDestination->keys()->map(static fn (mixed $id): int => (int) $id)->sort()->values();
+        if ($statesByDestination->count() !== $states->count()
+            || $deactivationsByDestination->count() !== $deactivations->count()
+            || $stateDestinationIds->all() !== $expectedDestinationIds->all()
+            || $deactivationDestinationIds->all() !== $expectedDestinationIds->all()) {
+            return null;
+        }
+        foreach ($statesByDestination as $destinationId => $state) {
+            $deactivation = $deactivationsByDestination->get($destinationId);
+            if ($state->phase !== BlueGreenDeploymentPhase::STOPPED
+                || ! $this->blueGreenStateIsRouteEmpty($state)
+                || ! $deactivation instanceof ApplicationBlueGreenDeactivation
+                || ! $this->blueGreenManualStopProofMatches($state, $deactivation)) {
+                return null;
+            }
+        }
+
+        return $expectedDestinationIds;
     }
 
     /** @param ?array{reason: BlueGreenIneligibilityReason, message: string} $ineligibility */

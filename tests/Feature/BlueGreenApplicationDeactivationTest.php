@@ -15,6 +15,7 @@ use App\Actions\Application\BlueGreen\DrainAndRemoveBlueGreenApplicationContaine
 use App\Actions\Application\BlueGreen\ExecuteBlueGreenDeactivationRemoteCommand;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenProxyDeactivation;
+use App\Actions\Application\BlueGreen\RemoveBlueGreenApplicationContainers;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenDeactivations;
 use App\Actions\Proxy\BlueGreenProxyRollbackArtifact;
@@ -145,6 +146,40 @@ it('drains every persisted backend port before deactivation removes application 
         greenRoutingRevision: 2,
         legacyContainerName: null,
         stopGracePeriodSeconds: 1,
+        replicaContainers: [[
+            'name' => $application->uuid.'-blue-2',
+            'id' => str_repeat('a', 64),
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'routingRevision' => 1,
+            'deploymentUuid' => 'replica-deployment',
+            'index' => 2,
+            'count' => 2,
+            'composeProject' => 'coolify-project',
+            'composeService' => 'web-blue-replica-2',
+            'ordinal' => 0,
+        ], [
+            'name' => $application->uuid.'-blue-worker-2',
+            'id' => str_repeat('b', 64),
+            'color' => BlueGreenDeploymentColor::BLUE,
+            'routingRevision' => 1,
+            'deploymentUuid' => 'replica-deployment',
+            'index' => 2,
+            'count' => 2,
+            'composeProject' => 'coolify-project',
+            'composeService' => 'worker-blue-replica-2',
+            'ordinal' => 1,
+        ], [
+            'name' => $application->uuid.'-green',
+            'id' => str_repeat('c', 64),
+            'color' => BlueGreenDeploymentColor::GREEN,
+            'routingRevision' => 2,
+            'deploymentUuid' => 'scalar-replica-deployment',
+            'index' => 1,
+            'count' => 1,
+            'composeProject' => 'coolify-project',
+            'composeService' => 'worker-green',
+            'ordinal' => 2,
+        ]],
     );
 
     $command = (new DrainAndRemoveBlueGreenApplicationContainers)->commandFor(
@@ -157,7 +192,85 @@ it('drains every persisted backend port before deactivation removes application 
         "backend_ports='0BB8 1F90'",
         'expected_ports[ports[index]] = 1',
         'toupper(endpoint[2]) in expected_ports',
+        '{{index .Config.Labels "coolify.blueGreen.deploymentUuid"}}',
+        'test "$container_id" = '.escapeshellarg(str_repeat('a', 64)),
+        'test "$container_id" = '.escapeshellarg(str_repeat('b', 64)),
+        'test "$container_id" = '.escapeshellarg(str_repeat('c', 64)),
+        '${replica_0_container_id:-}',
+        '${replica_1_container_id:-}',
+        '${replica_2_container_id:-}',
+        '! docker container inspect '.escapeshellarg($application->uuid.'-blue-2'),
+        '! docker container inspect '.escapeshellarg($application->uuid.'-blue-worker-2'),
     );
+});
+
+it('removes drift-named production containers through the immutable application label scope', function (): void {
+    ['application' => $application] = BlueGreenDeactivationScenario::context();
+    $plan = new BlueGreenContainerRemovalPlan(
+        applicationId: $application->id,
+        blueContainerName: $application->uuid.'-blue',
+        blueRoutingRevision: null,
+        greenContainerName: $application->uuid.'-green',
+        greenRoutingRevision: null,
+        legacyContainerName: null,
+        stopGracePeriodSeconds: 10,
+    );
+    $remover = new RemoveBlueGreenApplicationContainers;
+
+    $command = $remover->commandFor($plan);
+    $absence = $remover->assertAbsentCommandFor($plan);
+    $commandSyntax = new Symfony\Component\Process\Process(['bash', '-n']);
+    $commandSyntax->setInput($command)->run();
+    $absenceSyntax = new Symfony\Component\Process\Process(['bash', '-n']);
+    $absenceSyntax->setInput($absence)->run();
+
+    expect($commandSyntax->isSuccessful())->toBeTrue()
+        ->and($absenceSyntax->isSuccessful())->toBeTrue();
+    expect($command)
+        ->toContain("--filter 'label=coolify.applicationId={$application->id}'")
+        ->toContain('for container_id in $application_container_ids; do')
+        ->toContain('{{index .Config.Labels "coolify.applicationId"}} {{index .Config.Labels "coolify.managed"}} {{index .Config.Labels "coolify.pullRequestId"}} {{index .Config.Labels "coolify.type"}}')
+        ->toContain('[ "$metadata" = '.escapeshellarg("{$application->id} true 0 application").' ]')
+        ->toContain('test "$pull_request_id" -gt 0')
+        ->toContain('docker rm -f "$container_id" >/dev/null');
+    expect($absence)
+        ->toContain("--filter 'label=coolify.applicationId={$application->id}'")
+        ->toContain('test "$pull_request_id" -gt 0')
+        ->toContain('test "$metadata" != '.escapeshellarg("{$application->id} true 0 application"));
+});
+
+it('drains drift-named production containers before label-scoped removal', function (): void {
+    ['application' => $application, 'destination' => $destination, 'server' => $server] = BlueGreenDeactivationScenario::context();
+    $snapshot = BlueGreenDeactivationScenario::proxySnapshot($application, $destination, [3000]);
+    $plan = new BlueGreenContainerRemovalPlan(
+        applicationId: $application->id,
+        blueContainerName: $application->uuid.'-blue',
+        blueRoutingRevision: null,
+        greenContainerName: $application->uuid.'-green',
+        greenRoutingRevision: null,
+        legacyContainerName: null,
+        stopGracePeriodSeconds: 10,
+    );
+
+    $command = (new DrainAndRemoveBlueGreenApplicationContainers)->commandFor(
+        $server->proxyPath(),
+        $snapshot,
+        $plan,
+    );
+    $syntax = new Symfony\Component\Process\Process(['bash', '-n']);
+    $syntax->setInput($command)->run();
+
+    expect($syntax->isSuccessful())->toBeTrue();
+    expect($command)
+        ->toContain("application_container_filter='label=coolify.applicationId={$application->id}'")
+        ->toContain('{{.State.Pid}}|{{.State.Running}}')
+        ->toContain('test "$metadata" = '.escapeshellarg("{$application->id}|true|0|application"))
+        ->toContain('test "$pull_request_id" -gt 0')
+        ->toContain('test -r "/proc/$pid/net/tcp"')
+        ->toContain('mutation_active_connections=0')
+        ->toContain('[ "$mutation_production_container_ids" != "$stable_zero_container_ids" ]')
+        ->toContain('docker rm -f "$container_id" >/dev/null')
+        ->toContain('test "$metadata" != '.escapeshellarg("{$application->id}|true|0|application"));
 });
 
 it('uses the first canonical persisted backend port as the deactivation primary', function () {

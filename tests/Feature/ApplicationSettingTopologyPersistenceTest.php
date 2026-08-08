@@ -128,6 +128,35 @@ it('rejects quiet inactive-retention changes while a durable state is non-idle',
     expect($setting->fresh()->blue_green_inactive_retention_seconds)->toBe($originalRetention);
 });
 
+it('admits lifecycle setting mutation after an exact completed manual stop', function (): void {
+    $application = applicationSettingTopologyApplication();
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('f', 64);
+    $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 3,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('a', 64),
+        'application_routing_config_digest' => str_repeat('b', 64),
+    ]);
+    $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 3,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+    $setting = $application->settings()->firstOrFail();
+    $setting->blue_green_inactive_retention_seconds = 60;
+
+    expect($setting->saveQuietly())->toBeTrue()
+        ->and($setting->fresh()->blue_green_inactive_retention_seconds)->toBe(60);
+});
+
 it('rejects direct and quiet setting mutation after lifecycle ownership changes', function (bool $withDeactivation, bool $softDeleted, string $message, bool $quietly): void {
     $application = applicationSettingMutationOwner($withDeactivation, $softDeleted);
     $setting = $application->settings()->firstOrFail();

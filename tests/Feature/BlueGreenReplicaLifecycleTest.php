@@ -1138,22 +1138,29 @@ it('deactivation removes each replica only through its immutable identity and pr
         legacyContainerName: null,
         stopGracePeriodSeconds: 30,
         replicaContainers: [[
-            'name' => 'application-blue-replica-1-1',
+            'name' => 'application-blue',
             'id' => str_repeat('a', 64),
             'color' => BlueGreenDeploymentColor::BLUE,
             'routingRevision' => 12,
             'deploymentUuid' => 'replica-deactivation-release',
             'index' => 1,
+            'count' => 1,
+            'composeProject' => 'coolify-project',
+            'composeService' => 'web-blue-replica-1',
+            'ordinal' => 0,
         ]],
     );
     $remover = new RemoveBlueGreenApplicationContainers;
     $command = $remover->commandFor($plan);
 
     expect($command)->toContain(
-        'application-blue-replica-1-1',
-        'replica-deactivation-release blue 12 1',
+        'application-blue',
+        'replica-deactivation-release blue 12 coolify-project web-blue-replica-1',
         str_repeat('a', 64),
-    )->and($remover->assertAbsentCommandFor($plan))->toContain('application-blue-replica-1-1');
+    )->not->toContain(
+        'coolify.blueGreen.replicaIndex',
+        'coolify.blueGreen.replicaCount',
+    )->and($remover->assertAbsentCommandFor($plan))->toContain('application-blue');
 });
 
 it('persists immutable destination color index and release identity', function (): void {

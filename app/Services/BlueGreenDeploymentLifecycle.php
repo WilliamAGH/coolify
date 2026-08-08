@@ -567,7 +567,7 @@ final class BlueGreenDeploymentLifecycle
         $this->captureStoppedLegacyContainerForRetirement();
         $legacyRouteNetworkAttestation = null;
         if ($durableState?->destination_routing_topology_digest === null
-            && $this->destinationState !== null) {
+            && $this->destinationState?->managedSha256 !== null) {
             $attestationApplication = $this->application->fresh(['settings'])
                 ?? throw new DeploymentException('The blue-green application disappeared before legacy route attestation.');
             $attestationDestination = $this->destination->fresh(['server']);

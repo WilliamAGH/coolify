@@ -634,6 +634,7 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
     $application = $context['application'];
     $destination = $context['destination'];
     $startedAt = now()->subMinute()->startOfSecond();
+    $stopOperationId = str_repeat('a', 64);
 
     $application->update([
         'fqdn' => 'https://manual-stop-restart.example.test',
@@ -650,11 +651,15 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
         'standalone_docker_id' => $destination->id,
         'phase' => BlueGreenDeploymentPhase::STOPPED,
         'supersession_generation' => 4,
+        'destination_fence_operation_id' => $stopOperationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('b', 64),
+        'application_routing_config_digest' => str_repeat('c', 64),
     ]);
     ApplicationBlueGreenDeactivation::query()->create([
         'application_id' => $application->id,
         'standalone_docker_id' => $destination->id,
-        'operation_id' => str_repeat('a', 64),
+        'operation_id' => $stopOperationId,
         'started_at' => $startedAt,
         'queue_cutoff_id' => 0,
         'supersession_generation' => 4,
@@ -671,13 +676,18 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
     ]);
 
     $bootId = BlueGreenDeactivationScenario::BOOT_ID;
-    Process::fake(function (PendingProcess $process) use ($bootId) {
+    $legacyRouteAttestationAttempted = false;
+    Process::fake(function (PendingProcess $process) use ($bootId, &$legacyRouteAttestationAttempted) {
         $command = is_array($process->command)
             ? implode(' ', $process->command)
             : (string) $process->command;
         $payload = $command."\n".(string) $process->input;
 
+        if (str_contains($payload, 'coolify-blue-green-route-network-proof:')) {
+            $legacyRouteAttestationAttempted = true;
+        }
         if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+
             return Process::result(output: 'coolify-blue-green-destination-state-attested');
         }
         if (str_contains($payload, '/proc/sys/kernel/random/boot_id')) {
@@ -698,6 +708,7 @@ it('claims a fresh blue-green deployment from a stopped state', function () {
     $claim = $lifecycle->claim();
 
     expect($claim)->not->toBeNull()
+        ->and($legacyRouteAttestationAttempted)->toBeFalse()
         ->and($claim?->supersessionGeneration)->toBeGreaterThan(4)
         ->and($claim?->legacyContainerName)->toBeNull()
         ->and($lifecycle->previousContainerName())->toBeNull()

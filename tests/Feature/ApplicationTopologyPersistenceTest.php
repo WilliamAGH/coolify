@@ -1,11 +1,14 @@
 <?php
 
 use App\Enums\ApplicationDeploymentStatus;
+use App\Enums\BlueGreenDeactivationPhase;
+use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\BlueGreenIneligibilityReason;
 use App\Enums\ProxyTypes;
 use App\Exceptions\BlueGreenAdmissionException;
 use App\Models\Application;
 use App\Models\ApplicationBlueGreenDeactivation;
+use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Project;
 use App\Models\Server;
@@ -66,6 +69,33 @@ function applicationTopologyMutationOwner(bool $withDeactivation, bool $softDele
     return $application;
 }
 
+/** @return array{state: ApplicationBlueGreenDeployment, deactivation: ApplicationBlueGreenDeactivation} */
+function applicationTopologyStoppedProof(Application $application): array
+{
+    $startedAt = now()->subMinute()->startOfSecond();
+    $operationId = str_repeat('a', 64);
+    $state = $application->blueGreenDeployments()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'phase' => BlueGreenDeploymentPhase::STOPPED,
+        'supersession_generation' => 2,
+        'destination_fence_operation_id' => $operationId,
+        'destination_fence_mutation_sequence' => 1,
+        'destination_topology_digest' => str_repeat('b', 64),
+        'application_routing_config_digest' => str_repeat('c', 64),
+    ]);
+    $deactivation = $application->blueGreenDeactivations()->create([
+        'standalone_docker_id' => $application->destination_id,
+        'operation_id' => $operationId,
+        'started_at' => $startedAt,
+        'queue_cutoff_id' => 0,
+        'supersession_generation' => 2,
+        'phase' => BlueGreenDeactivationPhase::STOPPED,
+        'completed_at' => $startedAt->copy()->addSecond(),
+    ]);
+
+    return compact('state', 'deactivation');
+}
+
 it('rejects direct and quiet ineligibility changes once the application has deployment history', function (bool $quietly): void {
     $application = applicationTopologyPersistenceFixture();
     ApplicationDeploymentQueue::create([
@@ -122,6 +152,50 @@ it('rejects direct and quiet configuration mutation after lifecycle ownership ch
     'ordinary save' => false,
     'quiet save' => true,
 ]);
+
+it('admits topology mutation after every destination has an exact stopped and empty proof', function (): void {
+    $application = applicationTopologyPersistenceFixture(enableBlueGreen: false);
+    applicationTopologyStoppedProof($application);
+    $application->health_check_path = '/after-stop';
+
+    expect($application->saveQuietly())->toBeTrue()
+        ->and($application->fresh()->health_check_path)->toBe('/after-stop');
+});
+
+it('rejects topology mutation when a deployment owns an exactly stopped destination', function (): void {
+    $application = applicationTopologyPersistenceFixture(enableBlueGreen: false);
+    applicationTopologyStoppedProof($application);
+    ApplicationDeploymentQueue::query()->create([
+        'application_id' => $application->id,
+        'deployment_uuid' => 'queued-after-exact-stop',
+        'pull_request_id' => 0,
+        'destination_id' => $application->destination_id,
+        'server_id' => $application->destination->server_id,
+        'status' => ApplicationDeploymentStatus::QUEUED->value,
+    ]);
+    $application->health_check_path = '/blocked-after-stop';
+
+    expect(fn (): bool => $application->saveQuietly())
+        ->toThrow(BlueGreenAdmissionException::class, 'deployment owns a stopped destination');
+    expect($application->fresh()->health_check_path)->not->toBe('/blocked-after-stop');
+});
+
+it('rejects stopped topology mutation when a configured destination has no completed proof', function (): void {
+    $application = applicationTopologyPersistenceFixture(enableBlueGreen: false);
+    applicationTopologyStoppedProof($application);
+    $additionalServer = Server::factory()->create([
+        'team_id' => $application->environment->project->team_id,
+    ]);
+    $additionalDestination = $additionalServer->standaloneDockers()->firstOrFail();
+    $application->additional_networks()->attach($additionalDestination->id, [
+        'server_id' => $additionalServer->id,
+    ]);
+    $application->health_check_path = '/partial-stop-must-fail';
+
+    expect(fn (): bool => $application->saveQuietly())
+        ->toThrow(BlueGreenAdmissionException::class, 'every destination requires an exact completed stopped proof');
+    expect($application->fresh()->health_check_path)->not->toBe('/partial-stop-must-fail');
+});
 
 it('rebases stale non-dirty application attributes before a lifecycle update', function (): void {
     $staleApplication = applicationTopologyPersistenceFixture(enableBlueGreen: false);
