@@ -5875,6 +5875,15 @@ it('does not duplicate an already-reserved current-generator retirement', functi
         reason: 'Archive and requeue the exact mature inactive retirement once.',
         staleContainerJournal: true,
     );
+    $reservedState = $state->fresh();
+
+    expect($first->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($reservedState->inactive_retirement_attempts)->toBe(0)
+        ->and($reservedState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($reservedState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($reservedState->inactive_retirement_server_boot_id)->toBe('11111111-2222-3333-4444-555555555555')
+        ->and($reservedState->inactive_retirement_dispatch_reserved_until_at?->isFuture())->toBeTrue();
+
     $second = RecoverBlueGreenIntervention::run(
         stateId: $state->id,
         apply: true,
@@ -5882,8 +5891,7 @@ it('does not duplicate an already-reserved current-generator retirement', functi
         staleContainerJournal: true,
     );
 
-    expect($first->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
-        ->and($second->outcome)->toBe(BlueGreenInterventionRecoveryResult::SKIPPED);
+    expect($second->outcome)->toBe(BlueGreenInterventionRecoveryResult::SKIPPED);
     Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class, 1);
 });
 
