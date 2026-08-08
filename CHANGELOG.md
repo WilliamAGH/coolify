@@ -18,12 +18,14 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
 
 ### 🧪 Testing
 
 - *(factories)* Isolate factory name validation database
 - *(blue-green)* Enforce sanitized reconciliation failures
 - *(blue-green)* Pin retirement recovery reservation state
+- *(blue-green)* Unblock PostgreSQL retirement recovery gate
 
 ### ⚙️ Miscellaneous Tasks
 
