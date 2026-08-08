@@ -20,6 +20,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Validator;
 use OpenApi\Attributes as OA;
+use Symfony\Component\Yaml\Exception\ParseException;
 use Symfony\Component\Yaml\Yaml;
 
 class ServicesController extends Controller
@@ -43,6 +44,22 @@ class ServicesController extends Controller
         }
 
         return $storage;
+    }
+
+    private function safeComposeValidationMessage(\Throwable $exception): string
+    {
+        if ($exception instanceof ParseException) {
+            return 'Invalid YAML format.';
+        }
+
+        $message = $exception->getMessage();
+
+        return match (true) {
+            str_starts_with($message, 'Invalid YAML format:') => 'Invalid YAML format.',
+            str_starts_with($message, 'Invalid Docker Compose service name:') => 'Invalid Docker Compose service name. Service names must not contain shell metacharacters.',
+            str_starts_with($message, 'Invalid Docker volume definition') => 'Invalid Docker volume definition. Use safe path names without shell metacharacters.',
+            default => 'Docker Compose validation failed because a service name or volume path is unsafe.',
+        };
     }
 
     private function removeSensitiveData($service)
@@ -490,7 +507,7 @@ class ServicesController extends Controller
                     return response()->json([
                         'message' => 'Validation failed.',
                         'errors' => [
-                            'docker_compose_raw' => $e->getMessage(),
+                            'docker_compose_raw' => $this->safeComposeValidationMessage($e),
                         ],
                     ], 422);
                 }
@@ -688,17 +705,15 @@ class ServicesController extends Controller
                     ],
                 ], 422);
             }
-            $dockerCompose = base64_decode($request->docker_compose_raw);
-            $dockerComposeRaw = Yaml::dump(Yaml::parse($dockerCompose), 10, 2, Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK);
-
-            // Validate for command injection BEFORE saving to database
             try {
+                $dockerCompose = base64_decode($request->docker_compose_raw);
+                $dockerComposeRaw = Yaml::dump(Yaml::parse($dockerCompose), 10, 2, Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK);
                 validateDockerComposeForInjection($dockerComposeRaw);
             } catch (\Exception $e) {
                 return response()->json([
                     'message' => 'Validation failed.',
                     'errors' => [
-                        'docker_compose_raw' => $e->getMessage(),
+                        'docker_compose_raw' => $this->safeComposeValidationMessage($e),
                     ],
                 ], 422);
             }
@@ -1222,17 +1237,15 @@ class ServicesController extends Controller
                     ],
                 ], 422);
             }
-            $dockerCompose = base64_decode($request->docker_compose_raw);
-            $dockerComposeRaw = Yaml::dump(Yaml::parse($dockerCompose), 10, 2, Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK);
-
-            // Validate for command injection BEFORE saving to database
             try {
+                $dockerCompose = base64_decode($request->docker_compose_raw);
+                $dockerComposeRaw = Yaml::dump(Yaml::parse($dockerCompose), 10, 2, Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK);
                 validateDockerComposeForInjection($dockerComposeRaw);
             } catch (\Exception $e) {
                 return response()->json([
                     'message' => 'Validation failed.',
                     'errors' => [
-                        'docker_compose_raw' => $e->getMessage(),
+                        'docker_compose_raw' => $this->safeComposeValidationMessage($e),
                     ],
                 ], 422);
             }

@@ -1,5 +1,19 @@
 <?php
 
+use App\Http\Controllers\Api\ServicesController;
+
+test('service compose validation responses preserve actionable categories without echoing compose content', function () {
+    $controller = new ServicesController;
+    $method = new ReflectionMethod($controller, 'safeComposeValidationMessage');
+    $secret = 'COMPOSE-SECRET-MARKER unrelated-service-content';
+
+    expect($method->invoke($controller, new Exception("Invalid Docker volume definition (array syntax): {$secret}")))
+        ->toBe('Invalid Docker volume definition. Use safe path names without shell metacharacters.')
+        ->not->toContain($secret)
+        ->and($method->invoke($controller, new Exception("Invalid YAML format: {$secret}")))
+        ->toBe('Invalid YAML format.');
+});
+
 test('validateDockerComposeForInjection blocks malicious service names', function () {
     $maliciousCompose = <<<'YAML'
 services:
