@@ -597,6 +597,277 @@ it('keeps pending foreign boot-mismatched deactivation-only and unhealthy clean 
     'exact active runtime is not healthy' => ['runtime'],
 ]);
 
+it('archives a pending journal whose owner retirement is terminal and whose live route already equals the replacement', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $journalBootId = (string) $scenario->deployment->blue_green_server_boot_id;
+    $ownerDeploymentUuid = BlueGreenRecoveryScenario::OPERATION_UUID;
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+    ]);
+    // Pre-retirement managed route (fence before the drain mutation lands).
+    $journalExpectedState = ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ) ?? throw new RuntimeException('The terminal-retirement pending fixture requires a pre-mutation managed route.');
+    $replacementState = $journalExpectedState->withMutationOwner($ownerDeploymentUuid);
+    // markStopped advances the durable fence to the replacement while leaving the
+    // pending journal behind when the drain crash-orphaned it.
+    $scenario->state->update([
+        'destination_fence_operation_id' => $replacementState->operationId,
+        'destination_fence_mutation_sequence' => $replacementState->mutationSequence,
+        'inactive_retirement_owner_deployment_uuid' => $ownerDeploymentUuid,
+        'inactive_retirement_color' => BlueGreenDeploymentColor::GREEN->value,
+        'inactive_retirement_deployment_uuid' => 'predecessor-retired-deployment',
+        'inactive_retirement_container_id' => BlueGreenRecoveryScenario::LEGACY_ID,
+        'inactive_retirement_container_routing_revision' => 0,
+        'inactive_retirement_owner_routing_revision' => 1,
+        'inactive_retirement_supersession_generation' => 1,
+        'inactive_retirement_destination_fence_epoch' => 1,
+        'inactive_retirement_server_boot_id' => $journalBootId,
+        'inactive_retirement_topology_digest' => $scenario->state->destination_topology_digest,
+        'inactive_retirement_routing_config_digest' => $scenario->state->application_routing_config_digest,
+        'inactive_retirement_not_before_at' => now()->subMinutes(5),
+        'inactive_retirement_drain_deadline_at' => now()->subMinutes(3),
+        'inactive_retirement_stop_grace_seconds' => 30,
+        'inactive_retirement_lease_seconds' => 120,
+        'inactive_retirement_last_observed_connections' => 0,
+        'inactive_retirement_observed_at' => now()->subMinute(),
+        'inactive_retirement_attempts' => 1,
+        'inactive_retirement_stopped_at' => now()->subMinute(),
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => null,
+    ]);
+    $durableState = ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ) ?? throw new RuntimeException('The terminal-retirement pending fixture requires an exact post-retirement managed route.');
+    expect(BlueGreenProxyState::matches($durableState, $replacementState))->toBeTrue()
+        ->and($replacementState->isMutationSuccessorOf($journalExpectedState, $ownerDeploymentUuid))->toBeTrue();
+    $journalSha256 = hash('sha256', 'terminal-retirement-pending-leftover');
+    $journalPresent = true;
+    $payloads = [];
+    $archiveAttempted = false;
+    $mutationScriptInvoked = false;
+
+    Process::fake(function (PendingProcess $process) use (
+        $journalBootId,
+        $journalExpectedState,
+        $journalSha256,
+        $replacementState,
+        &$archiveAttempted,
+        &$journalPresent,
+        &$mutationScriptInvoked,
+        &$payloads,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        $payloads[] = $payload;
+        if (isCleanIdleBootIdentityRead($payload)) {
+            return Process::result(output: $journalBootId);
+        }
+        if (str_contains($payload, 'operation_container_manifest_stage=')) {
+            $archiveAttempted = true;
+            $mutationScriptInvoked = $mutationScriptInvoked
+                || str_contains($payload, 'sh "$operation_container_mutation_decoded"')
+                || str_contains($payload, 'sh "$operation_container_completion_decoded"')
+                || str_contains($payload, 'operation_container_state_stage=')
+                || str_contains($payload, 'durable_remote_replace "$operation_container_state_stage"');
+            $journalPresent = false;
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
+                $journalSha256,
+                (new WriteBlueGreenProxyConfiguration)->containerMutationJournalArchiveFilename(
+                    $replacementState->managedFilename,
+                    $journalSha256,
+                ),
+            ]));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            if (! $journalPresent) {
+                return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
+            }
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
+                $journalSha256,
+                $journalBootId,
+                BlueGreenProxyRollbackArtifact::PRESENT_STATE,
+                $replacementState->managedSha256,
+                hash('sha256', 'terminal-retirement-mutation-script'),
+                hash('sha256', 'terminal-retirement-completion-script'),
+            ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($replacementState->serialize()));
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($replacementState->serialize())."\n".$replacementState->managedSha256);
+        }
+
+        return Process::result(errorOutput: 'Unexpected terminal-retirement pending journal recovery command.', exitCode: 1);
+    });
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $replacementState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
+
+    $recovered = RecoverCleanIdleBlueGreenContainerMutationJournal::run(
+        $scenario->server,
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    );
+    $allPayloads = implode("\n", $payloads);
+
+    expect($recovered)->toBeInstanceOf(BlueGreenProxyState::class)
+        ->and($recovered?->serialize())->toBe($replacementState->serialize())
+        ->and($archiveAttempted)->toBeTrue()
+        ->and($journalPresent)->toBeFalse()
+        ->and($mutationScriptInvoked)->toBeFalse()
+        ->and($allPayloads)->toContain('operation_container_manifest_stage=')
+        ->not->toContain(
+            'sh "$operation_container_mutation_decoded"',
+            'sh "$operation_container_completion_decoded"',
+            'committed_container_manifest_stage=',
+        );
+});
+
+it('keeps terminal-retirement pending journals fenced unless ownership live route and terminal flags all match', function (string $failure): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $journalBootId = (string) $scenario->deployment->blue_green_server_boot_id;
+    $ownerDeploymentUuid = BlueGreenRecoveryScenario::OPERATION_UUID;
+    $retirementAttributes = [
+        'inactive_retirement_owner_deployment_uuid' => $ownerDeploymentUuid,
+        'inactive_retirement_color' => BlueGreenDeploymentColor::GREEN->value,
+        'inactive_retirement_deployment_uuid' => 'predecessor-retired-deployment',
+        'inactive_retirement_container_id' => BlueGreenRecoveryScenario::LEGACY_ID,
+        'inactive_retirement_container_routing_revision' => 0,
+        'inactive_retirement_owner_routing_revision' => 1,
+        'inactive_retirement_supersession_generation' => 1,
+        'inactive_retirement_destination_fence_epoch' => 1,
+        'inactive_retirement_server_boot_id' => $journalBootId,
+        'inactive_retirement_topology_digest' => $scenario->state->destination_topology_digest,
+        'inactive_retirement_routing_config_digest' => $scenario->state->application_routing_config_digest,
+        'inactive_retirement_not_before_at' => now()->subMinutes(5),
+        'inactive_retirement_drain_deadline_at' => now()->subMinutes(3),
+        'inactive_retirement_stop_grace_seconds' => 30,
+        'inactive_retirement_lease_seconds' => 120,
+        'inactive_retirement_last_observed_connections' => 0,
+        'inactive_retirement_observed_at' => now()->subMinute(),
+        'inactive_retirement_attempts' => 1,
+        'inactive_retirement_stopped_at' => now()->subMinute(),
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => null,
+    ];
+    if ($failure === 'cleared') {
+        $retirementAttributes = ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes();
+    }
+    if ($failure === 'wrong-owner') {
+        $retirementAttributes['inactive_retirement_owner_deployment_uuid'] = 'foreign-retirement-owner';
+    }
+    if ($failure === 'wrong-boot') {
+        $retirementAttributes['inactive_retirement_server_boot_id'] = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    }
+    if ($failure === 'intervention') {
+        $retirementAttributes['inactive_retirement_intervention_required_at'] = now()->subMinute();
+    }
+    if ($failure === 'reserved') {
+        $retirementAttributes['inactive_retirement_dispatch_reserved_until_at'] = now()->addMinute();
+    }
+    if ($failure === 'not-stopped') {
+        $retirementAttributes['inactive_retirement_stopped_at'] = null;
+    }
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+        ...$retirementAttributes,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+    ]);
+    $replacementState = ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ) ?? throw new RuntimeException('The terminal-retirement negative fixture requires an exact managed route.');
+    $journalExpectedState = cleanIdleJournalStateWithOperation($replacementState, 'terminal-retirement-negative-predecessor');
+    $journalSha256 = hash('sha256', "terminal-retirement-negative-{$failure}");
+    $casAttempted = false;
+    $liveState = $failure === 'live-mismatch'
+        ? cleanIdleJournalStateWithOperation($replacementState, 'live-route-diverged')
+        : $replacementState;
+
+    Process::fake(function (PendingProcess $process) use (
+        &$casAttempted,
+        $journalBootId,
+        $journalExpectedState,
+        $journalSha256,
+        $liveState,
+        $replacementState,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (isCleanIdleBootIdentityRead($payload)) {
+            return Process::result(output: $journalBootId);
+        }
+        if (str_contains($payload, 'operation_container_manifest_stage=')) {
+            $casAttempted = true;
+
+            return Process::result(errorOutput: 'An ambiguous terminal-retirement journal must not reach CAS.', exitCode: 1);
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::PENDING_EXPECTED_SIDECAR,
+                $journalSha256,
+                $journalBootId,
+                BlueGreenProxyRollbackArtifact::PRESENT_STATE,
+                $replacementState->managedSha256,
+                hash('sha256', 'terminal-retirement-negative-mutation'),
+                hash('sha256', 'terminal-retirement-negative-completion'),
+            ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($replacementState->serialize()));
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($liveState->serialize())."\n".$liveState->managedSha256);
+        }
+
+        return Process::result(errorOutput: 'Unexpected terminal-retirement negative recovery command.', exitCode: 1);
+    });
+    InspectBlueGreenContainer::shouldNotRun();
+
+    expect(fn () => RecoverCleanIdleBlueGreenContainerMutationJournal::run(
+        $scenario->server,
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ))->toThrow(BlueGreenDeploymentTransitionException::class)
+        ->and($casAttempted)->toBeFalse();
+})->with([
+    'cleared retirement provenance remains ambiguous' => ['cleared'],
+    'wrong retirement owner remains fenced' => ['wrong-owner'],
+    'wrong retirement boot remains fenced' => ['wrong-boot'],
+    'intervention-marked retirement remains fenced' => ['intervention'],
+    'dispatch-reserved retirement remains fenced' => ['reserved'],
+    'unstopped retirement remains fenced' => ['not-stopped'],
+    'live route mismatch remains fenced' => ['live-mismatch'],
+]);
+
 it('invokes the same clean idle coordinator from ordinary destination attestation', function (): void {
     $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
     $scenario->state->update([

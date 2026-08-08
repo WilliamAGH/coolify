@@ -72,7 +72,16 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                 return $inspection->state;
             }
             if ($inspection->hasPendingExpectedSidecar()) {
-                throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
+                return $this->archiveTerminalRetirementPendingJournal(
+                    $reader,
+                    $server,
+                    $application,
+                    $destination,
+                    $candidate,
+                    $inspection,
+                    $operationFence,
+                    $currentBootId,
+                );
             }
             if (! $inspection->hasCommittedReplacementSidecar()
                 || $inspection->replacementState === null
@@ -150,6 +159,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         int $expectedStateId,
         ?string $expectedOperationId = null,
         ?string $expectedJournalBootId = null,
+        bool $requireTerminalRetirementOwner = false,
     ): ?BlueGreenProxyState {
         return DB::transaction(function () use (
             $application,
@@ -157,6 +167,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
             $expectedJournalBootId,
             $expectedOperationId,
             $expectedStateId,
+            $requireTerminalRetirementOwner,
         ): ?BlueGreenProxyState {
             $locks = BlueGreenLifecycleDatabaseLocks::forDestination(
                 (int) $application->getKey(),
@@ -201,9 +212,25 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                 $state,
             );
             if ($expectedOperationId !== null) {
-                if ($expectedState === null
-                    || ! hash_equals($expectedOperationId, $expectedState->operationId)
-                    || $expectedJournalBootId === null
+                if ($expectedState === null || $expectedJournalBootId === null) {
+                    throw new BlueGreenDeploymentTransitionException(
+                        $requireTerminalRetirementOwner
+                            ? 'The pending clean IDLE container-mutation journal is ambiguous and remains fenced.'
+                            : 'The committed clean IDLE journal has no exact terminal operation and boot provenance.',
+                    );
+                }
+                if ($requireTerminalRetirementOwner) {
+                    // Terminal-retirement pending leftovers prove ownership through
+                    // durable retirement provenance, not the active fence operation id
+                    // (which may already have advanced past the retirement owner).
+                    if (! $this->inactiveRetirementIsExactTerminalOwner(
+                        $state,
+                        $expectedOperationId,
+                        $expectedJournalBootId,
+                    )) {
+                        throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
+                    }
+                } elseif (! hash_equals($expectedOperationId, $expectedState->operationId)
                     || ! $this->hasExactTerminalOperation(
                         $locks,
                         $state,
@@ -226,6 +253,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         BlueGreenProxyState $snapshot,
         string $expectedOperationId,
         string $expectedJournalBootId,
+        bool $requireTerminalRetirementOwner = false,
     ): void {
         $current = $this->cleanIdleSnapshot(
             $application,
@@ -233,6 +261,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
             $expectedStateId,
             $expectedOperationId,
             $expectedJournalBootId,
+            $requireTerminalRetirementOwner,
         );
         if (! BlueGreenProxyState::matches($current, $snapshot)) {
             throw new BlueGreenOperationFenceLostException('The clean IDLE destination changed during journal recovery.');
@@ -252,6 +281,108 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
             ->exists();
     }
 
+    /**
+     * A pending journal whose owner retirement is durably terminal and whose
+     * live route already equals the journal replacement is complete leftover
+     * work from a crashed drain attempt. Archive without replaying scripts.
+     * Any other pending shape remains ambiguous and stays fenced.
+     */
+    private function archiveTerminalRetirementPendingJournal(
+        ReadBlueGreenManagedRouteMetadataForOperation $reader,
+        Server $server,
+        Application $application,
+        StandaloneDocker $destination,
+        ApplicationBlueGreenDeployment $candidate,
+        BlueGreenManagedRouteMetadataForOperationResult $inspection,
+        BlueGreenOperationFence $operationFence,
+        string $currentBootId,
+    ): BlueGreenProxyState {
+        if ($inspection->replacementState === null
+            || $inspection->journalBootId === null
+            || $inspection->expectedState === null) {
+            throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
+        }
+
+        $operationId = $inspection->replacementState->operationId;
+        $expectedState = $this->cleanIdleSnapshot(
+            $application,
+            $destination,
+            (int) $candidate->getKey(),
+            $operationId,
+            $inspection->journalBootId,
+            requireTerminalRetirementOwner: true,
+        );
+        // Live route must already equal the journal replacement. The pending
+        // journal's expected sidecar is the pre-retirement predecessor and is
+        // intentionally not compared as the durable destination identity.
+        if ($expectedState === null
+            || ! BlueGreenProxyState::matches($inspection->replacementState, $expectedState)) {
+            throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
+        }
+
+        $liveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+        if (! BlueGreenProxyState::matches($liveState, $expectedState)) {
+            throw new BlueGreenDeploymentTransitionException('The pending clean IDLE container-mutation journal is ambiguous and remains fenced.');
+        }
+
+        $this->assertExactActiveRuntime(
+            $server,
+            $application,
+            $destination,
+            $candidate,
+            $expectedState,
+        );
+        $operationFence->assertLockOwnership();
+        $this->assertSnapshotUnchanged(
+            $application,
+            $destination,
+            (int) $candidate->getKey(),
+            $expectedState,
+            $operationId,
+            $inspection->journalBootId,
+            requireTerminalRetirementOwner: true,
+        );
+
+        try {
+            $archivedExpected = $reader->archivePendingExpectedSidecar(
+                $server,
+                $application,
+                $destination,
+                $operationId,
+                $inspection,
+                $currentBootId,
+            );
+        } catch (Throwable $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The terminal-retirement pending clean IDLE journal could not be CAS-archived safely.',
+                0,
+                $exception,
+            );
+        }
+        // archivePendingExpectedSidecar returns the journal's expected (pre-mutation)
+        // sidecar; the durable destination identity is the replacement we already proved.
+        if ($archivedExpected !== null
+            && ! BlueGreenProxyState::matches($archivedExpected, $inspection->expectedState)) {
+            throw new BlueGreenDeploymentTransitionException('The terminal-retirement pending clean IDLE journal CAS changed its expected sidecar.');
+        }
+        $operationFence->assertLockOwnership();
+        $postArchiveState = ReadBlueGreenManagedRouteMetadata::run($server, $application, $destination);
+        if (! BlueGreenProxyState::matches($postArchiveState, $expectedState)) {
+            throw new BlueGreenDeploymentTransitionException('The clean IDLE destination did not retain its exact managed route after terminal-retirement journal archival.');
+        }
+        $this->assertSnapshotUnchanged(
+            $application,
+            $destination,
+            (int) $candidate->getKey(),
+            $expectedState,
+            $operationId,
+            $inspection->journalBootId,
+            requireTerminalRetirementOwner: true,
+        );
+
+        return $postArchiveState;
+    }
+
     private function inactiveRetirementIsTerminalOrCleared(ApplicationBlueGreenDeployment $state): bool
     {
         foreach (ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes() as $attribute => $expected) {
@@ -263,6 +394,20 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         }
 
         return true;
+    }
+
+    private function inactiveRetirementIsExactTerminalOwner(
+        ApplicationBlueGreenDeployment $state,
+        string $operationId,
+        string $journalBootId,
+    ): bool {
+        return $state->inactive_retirement_stopped_at !== null
+            && $state->inactive_retirement_intervention_required_at === null
+            && $state->inactive_retirement_dispatch_reserved_until_at === null
+            && is_string($state->inactive_retirement_owner_deployment_uuid)
+            && hash_equals($operationId, $state->inactive_retirement_owner_deployment_uuid)
+            && is_string($state->inactive_retirement_server_boot_id)
+            && hash_equals($journalBootId, $state->inactive_retirement_server_boot_id);
     }
 
     private function hasExactTerminalOperation(
