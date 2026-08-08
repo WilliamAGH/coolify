@@ -15,6 +15,7 @@ use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use App\Models\Server;
 use App\Models\StandaloneDocker;
+use Exception;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -81,8 +82,30 @@ final class RetireBlueGreenInactiveContainer
             if ($snapshot === null) {
                 return self::STALE;
             }
+            if ($snapshot->inactive_retirement_owner_deployment_uuid === $ownerDeploymentUuid
+                && $snapshot->inactive_retirement_supersession_generation === $supersessionGeneration
+                && $snapshot->inactive_retirement_stopped_at !== null) {
+                return self::COMPLETED;
+            }
             if ($snapshot->destination_routing_topology_digest === null) {
                 $rehydrator = new RehydrateBlueGreenDestinationRoutingTopologyDigest;
+                if ($snapshot->inactive_retirement_intervention_required_at !== null) {
+                    $this->rehydratePendingJournal(
+                        $rehydrator,
+                        $snapshot,
+                        $operationFence,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                    );
+                    $operationFence->assertLockOwnership();
+
+                    return $this->recoverInterruptedRetirement(
+                        $stateId,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                        $operationFence,
+                    ) ?? self::RETRY;
+                }
                 try {
                     $rehydrator->handleUnderFence(
                         $snapshot,
@@ -90,12 +113,23 @@ final class RetireBlueGreenInactiveContainer
                         $ownerDeploymentUuid,
                         $supersessionGeneration,
                     );
-                } catch (Throwable $exception) {
+                } catch (BlueGreenOperationFenceLostException $exception) {
+                    throw $exception;
+                } catch (Exception $exception) {
                     if (! str_contains($exception->getMessage(), WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)) {
-                        throw $exception;
+                        if ($exception instanceof BlueGreenDeploymentTransitionException) {
+                            throw $exception;
+                        }
+
+                        throw new BlueGreenDeploymentTransitionException(
+                            'The inactive-retirement destination topology digest could not be rehydrated.',
+                            0,
+                            $exception,
+                        );
                     }
 
-                    $rehydrator->rehydratePendingInactiveRetirementJournalUnderFence(
+                    $this->rehydratePendingJournal(
+                        $rehydrator,
                         $snapshot,
                         $operationFence,
                         $ownerDeploymentUuid,
@@ -220,7 +254,16 @@ final class RetireBlueGreenInactiveContainer
             }
             $replacementState = $expectedState->withMutationOwner($ownerDeploymentUuid);
             if (self::isTerminalStoppedStatus($inspection->status)) {
-                if ($this->attestDestinationState($server, $replacementState)) {
+                $replacementAttestation = $this->attestDestinationState($server, $replacementState);
+                if ($replacementAttestation === self::PENDING) {
+                    return $this->recoverJournalBlockedRetirement(
+                        $stateId,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                        $operationFence,
+                    );
+                }
+                if ($replacementAttestation) {
                     $this->assertRetirementOwnership(
                         $operationFence,
                         $state->id,
@@ -231,7 +274,16 @@ final class RetireBlueGreenInactiveContainer
 
                     return self::COMPLETED;
                 }
-                if (! $this->attestDestinationState($server, $expectedState)) {
+                $expectedAttestation = $this->attestDestinationState($server, $expectedState);
+                if ($expectedAttestation === self::PENDING) {
+                    return $this->recoverJournalBlockedRetirement(
+                        $stateId,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                        $operationFence,
+                    );
+                }
+                if (! $expectedAttestation) {
                     $this->assertRetirementOwnership(
                         $operationFence,
                         $state->id,
@@ -408,6 +460,17 @@ final class RetireBlueGreenInactiveContainer
                 ->where('deployment_uuid', $ownerDeploymentUuid)
                 ->first();
 
+            try {
+                $this->assertRetirementFenceOwnership(
+                    $operationFence,
+                    $state->id,
+                    $ownerDeploymentUuid,
+                    $supersessionGeneration,
+                );
+            } catch (BlueGreenOperationFenceLostException) {
+                return self::STALE;
+            }
+
             if ($state->inactive_retirement_intervention_required_at !== null) {
                 $correlationId = $this->reportRetirementFailure(
                     $exception,
@@ -422,6 +485,17 @@ final class RetireBlueGreenInactiveContainer
                 return self::INTERVENTION;
             }
             if ($exception instanceof BlueGreenAmbiguousDestinationMutationException) {
+                try {
+                    $this->assertRetirementOwnership(
+                        $operationFence,
+                        $state->id,
+                        $ownerDeploymentUuid,
+                        $supersessionGeneration,
+                    );
+                } catch (BlueGreenOperationFenceLostException) {
+                    return self::STALE;
+                }
+
                 return $this->recordAmbiguousMutation($state, $owner, $exception);
             }
 
@@ -432,6 +506,53 @@ final class RetireBlueGreenInactiveContainer
             } catch (Throwable $exception) {
                 report($exception);
             }
+        }
+    }
+
+    private function assertRetirementFenceOwnership(
+        BlueGreenOperationFence $operationFence,
+        int $stateId,
+        string $ownerDeploymentUuid,
+        int $generation,
+    ): void {
+        $operationFence->assertLockOwnership();
+
+        $ownsRetirement = ApplicationBlueGreenDeployment::query()
+            ->whereKey($stateId)
+            ->where('inactive_retirement_owner_deployment_uuid', $ownerDeploymentUuid)
+            ->where('inactive_retirement_supersession_generation', $generation)
+            ->exists();
+        if (! $ownsRetirement) {
+            throw new BlueGreenOperationFenceLostException(
+                'The inactive-retirement operation no longer owns its exact retirement fence.',
+            );
+        }
+    }
+
+    private function rehydratePendingJournal(
+        RehydrateBlueGreenDestinationRoutingTopologyDigest $rehydrator,
+        ApplicationBlueGreenDeployment $snapshot,
+        BlueGreenOperationFence $operationFence,
+        string $ownerDeploymentUuid,
+        int $supersessionGeneration,
+    ): void {
+        try {
+            $rehydrator->rehydratePendingInactiveRetirementJournalUnderFence(
+                $snapshot,
+                $operationFence,
+                $ownerDeploymentUuid,
+                $supersessionGeneration,
+            );
+        } catch (BlueGreenDeploymentTransitionException $exception) {
+            throw $exception;
+        } catch (BlueGreenOperationFenceLostException $exception) {
+            throw $exception;
+        } catch (Exception $exception) {
+            throw new BlueGreenDeploymentTransitionException(
+                'The pending inactive-retirement journal could not rehydrate its destination topology digest.',
+                0,
+                $exception,
+            );
         }
     }
 
@@ -543,7 +664,16 @@ final class RetireBlueGreenInactiveContainer
         if (! $isFinalAttempt && collect($inspections)->every(
             static fn (BlueGreenReplicaInspection $inspection): bool => self::isTerminalStoppedStatus($inspection->status),
         )) {
-            if ($this->attestDestinationState($server, $replacementState)) {
+            $replacementAttestation = $this->attestDestinationState($server, $replacementState);
+            if ($replacementAttestation === self::PENDING) {
+                return $this->recoverJournalBlockedRetirement(
+                    $state->id,
+                    $ownerDeployment->deployment_uuid,
+                    $supersessionGeneration,
+                    $operationFence,
+                );
+            }
+            if ($replacementAttestation) {
                 $this->assertRetirementOwnership(
                     $operationFence,
                     $state->id,
@@ -560,7 +690,16 @@ final class RetireBlueGreenInactiveContainer
 
                 return self::COMPLETED;
             }
-            if (! $this->attestDestinationState($server, $expectedState)) {
+            $expectedAttestation = $this->attestDestinationState($server, $expectedState);
+            if ($expectedAttestation === self::PENDING) {
+                return $this->recoverJournalBlockedRetirement(
+                    $state->id,
+                    $ownerDeployment->deployment_uuid,
+                    $supersessionGeneration,
+                    $operationFence,
+                );
+            }
+            if (! $expectedAttestation) {
                 $this->assertRetirementOwnership(
                     $operationFence,
                     $state->id,
@@ -2421,23 +2560,29 @@ final class RetireBlueGreenInactiveContainer
         ?ApplicationDeploymentQueue $owner,
         BlueGreenAmbiguousDestinationMutationException $exception,
     ): string {
+        $attempts = $state->inactive_retirement_attempts + 1;
+        $interventionAt = $attempts >= self::MAX_ATTEMPTS ? now() : null;
+        $updated = ApplicationBlueGreenDeployment::query()
+            ->whereKey($state->id)
+            ->where('inactive_retirement_owner_deployment_uuid', $state->inactive_retirement_owner_deployment_uuid)
+            ->where('inactive_retirement_supersession_generation', $state->inactive_retirement_supersession_generation)
+            ->where('inactive_retirement_attempts', $state->inactive_retirement_attempts)
+            ->whereNull('inactive_retirement_stopped_at')
+            ->whereNull('inactive_retirement_intervention_required_at')
+            ->update([
+                'inactive_retirement_attempts' => $attempts,
+                'inactive_retirement_observed_at' => now(),
+                'inactive_retirement_intervention_required_at' => $interventionAt,
+            ]);
+        if ($updated !== 1) {
+            return self::STALE;
+        }
         $correlationId = (string) Str::uuid();
         report(new BlueGreenAmbiguousDestinationMutationException(
             'reason='.self::AMBIGUOUS_MUTATION_REASON." correlation_id={$correlationId}",
             0,
             $exception,
         ));
-        $attempts = $state->inactive_retirement_attempts + 1;
-        $interventionAt = $attempts >= self::MAX_ATTEMPTS ? now() : null;
-        ApplicationBlueGreenDeployment::query()
-            ->whereKey($state->id)
-            ->where('inactive_retirement_owner_deployment_uuid', $state->inactive_retirement_owner_deployment_uuid)
-            ->where('inactive_retirement_supersession_generation', $state->inactive_retirement_supersession_generation)
-            ->update([
-                'inactive_retirement_attempts' => $attempts,
-                'inactive_retirement_observed_at' => now(),
-                'inactive_retirement_intervention_required_at' => $interventionAt,
-            ]);
         $diagnostic = ' reason='.self::AMBIGUOUS_MUTATION_REASON." correlation_id={$correlationId}";
         $owner?->addLogEntry($interventionAt === null
             ? "Inactive blue-green retirement observed an ambiguous destination mutation result; queued a bounded retirement retry.{$diagnostic}"
@@ -2452,11 +2597,16 @@ final class RetireBlueGreenInactiveContainer
         string $message,
         ?Throwable $exception = null,
     ): string {
-        ApplicationBlueGreenDeployment::query()
+        $updated = ApplicationBlueGreenDeployment::query()
             ->whereKey($state->id)
             ->where('inactive_retirement_owner_deployment_uuid', $state->inactive_retirement_owner_deployment_uuid)
             ->where('inactive_retirement_supersession_generation', $state->inactive_retirement_supersession_generation)
+            ->whereNull('inactive_retirement_stopped_at')
+            ->whereNull('inactive_retirement_intervention_required_at')
             ->update(['inactive_retirement_intervention_required_at' => now()]);
+        if ($updated !== 1) {
+            return self::STALE;
+        }
         if ($exception === null) {
             $owner?->addLogEntry("Inactive blue-green retirement requires intervention: {$message}", 'stderr');
 
@@ -2564,7 +2714,7 @@ final class RetireBlueGreenInactiveContainer
             : "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} was stopped and retained for fast rollback.");
     }
 
-    private function attestDestinationState(Server $server, BlueGreenProxyState $state): bool
+    private function attestDestinationState(Server $server, BlueGreenProxyState $state): bool|string
     {
         try {
             $result = trim((string) instant_privileged_remote_script(
@@ -2577,8 +2727,19 @@ final class RetireBlueGreenInactiveContainer
             ));
 
             return $result === 'coolify-blue-green-destination-state-attested';
-        } catch (Throwable) {
-            return false;
+        } catch (Exception $exception) {
+            if (str_contains($exception->getMessage(), WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)) {
+                return self::PENDING;
+            }
+            if ($exception instanceof BlueGreenDeploymentTransitionException) {
+                throw $exception;
+            }
+
+            throw new BlueGreenDeploymentTransitionException(
+                'The inactive-retirement destination state could not be attested.',
+                0,
+                $exception,
+            );
         }
     }
 }

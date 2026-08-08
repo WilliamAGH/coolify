@@ -584,7 +584,6 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             && $state->inactive_retirement_lease_seconds > 0
             && is_int($state->inactive_retirement_attempts)
             && $state->inactive_retirement_attempts >= 0
-            && $state->inactive_retirement_stopped_at === null
-            && $state->inactive_retirement_intervention_required_at === null;
+            && $state->inactive_retirement_stopped_at === null;
     }
 }

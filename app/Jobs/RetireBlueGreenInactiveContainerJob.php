@@ -3,6 +3,7 @@
 namespace App\Jobs;
 
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
 use App\Models\ApplicationBlueGreenDeployment;
 use App\Models\ApplicationDeploymentQueue;
@@ -11,6 +12,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Str;
 use Throwable;
 
 final class RetireBlueGreenInactiveContainerJob implements ShouldQueue
@@ -66,6 +68,12 @@ final class RetireBlueGreenInactiveContainerJob implements ShouldQueue
         if ($exception === null) {
             return;
         }
+        $correlationId = (string) Str::uuid();
+        report(new BlueGreenDeploymentTransitionException(
+            "reason=retirement_worker_failure correlation_id={$correlationId}",
+            0,
+            $exception,
+        ));
         $state = ApplicationBlueGreenDeployment::query()
             ->whereKey($this->stateId)
             ->where('inactive_retirement_owner_deployment_uuid', $this->ownerDeploymentUuid)
@@ -79,7 +87,8 @@ final class RetireBlueGreenInactiveContainerJob implements ShouldQueue
             ->where('deployment_uuid', $this->ownerDeploymentUuid)
             ->first();
         $owner?->addLogEntry(
-            'Inactive blue-green retirement worker failed before exact lifecycle completion; durable state was left for scheduled redispatch: '.$exception->getMessage(),
+            'Inactive blue-green retirement worker failed before exact lifecycle completion; durable state was left for scheduled redispatch: '
+            ."reason=retirement_worker_failure correlation_id={$correlationId}",
             'stderr',
         );
     }

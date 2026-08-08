@@ -5,6 +5,7 @@ use App\Actions\Application\BlueGreen\BlueGreenBackendPortInventory;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
+use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
@@ -379,6 +380,7 @@ it('bounds the worker and lifecycle lease for drain plus docker stop at maximum 
 });
 
 it('leaves an exact failed retirement owner durable for scheduled redispatch', function () {
+    $marker = 'ssh: root@10.66.0.99 PRIVILEGED-INACTIVE-RETIREMENT-WORKER-STDERR-MARKER docker inspect permission denied';
     $application = makeBlueGreenInactiveRetirementApplication();
     $owner = ApplicationDeploymentQueue::query()->create([
         'application_id' => $application->id,
@@ -402,14 +404,27 @@ it('leaves an exact failed retirement owner durable for scheduled redispatch', f
         'inactive_retirement_not_before_at' => now()->subSecond(),
         'inactive_retirement_lease_seconds' => 4_000,
     ]);
+    Exceptions::fake();
 
     (new RetireBlueGreenInactiveContainerJob($state->id, $owner->deployment_uuid, 2, 4_060))
-        ->failed(new RuntimeException('worker transport failed'));
+        ->failed(new RuntimeException($marker));
 
     $logs = json_decode($owner->fresh()->logs, associative: true, flags: JSON_THROW_ON_ERROR);
+    $correlationMatches = [];
+    expect(preg_match('/reason=retirement_worker_failure correlation_id=([a-f0-9-]{36})/', $logs[0]['output'], $correlationMatches))
+        ->toBe(1);
+    $correlationId = $correlationMatches[1] ?? throw new RuntimeException('The worker failure log requires a correlation ID.');
     expect($state->fresh()->inactive_retirement_stopped_at)->toBeNull()
         ->and($logs)->toHaveCount(1)
-        ->and($logs[0]['output'])->toContain('durable state was left for scheduled redispatch');
+        ->and($logs[0]['output'])->toBe(
+            'Inactive blue-green retirement worker failed before exact lifecycle completion; durable state was left for scheduled redispatch: '
+            ."reason=retirement_worker_failure correlation_id={$correlationId}",
+        )
+        ->and($logs[0]['output'])->not->toContain($marker);
+    Exceptions::assertReported(function (BlueGreenDeploymentTransitionException $reported) use ($correlationId, $marker): bool {
+        return $reported->getMessage() === "reason=retirement_worker_failure correlation_id={$correlationId}"
+            && $reported->getPrevious()?->getMessage() === $marker;
+    });
 });
 
 it('treats a delayed retirement as stale after supersession without remote work', function () {
@@ -3100,6 +3115,79 @@ it('clears a pending expected-sidecar journal and retires only the running membe
         );
 });
 
+it('archives a pending journal when every inactive replica is terminal without replaying a mutation', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirementWithV3ActiveContainerSet();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state->fresh(),
+    ) ?? throw new RuntimeException('The pending terminal-replica fixture requires an exact expected route state.');
+    $replacementState = $expectedState->withMutationOwner($owner->deployment_uuid);
+    $inactiveReplicas = ApplicationBlueGreenReplica::query()
+        ->where('application_blue_green_deployment_id', $state->id)
+        ->where('deployment_uuid', $state->inactive_retirement_deployment_uuid)
+        ->orderBy('replica_index')
+        ->orderBy('compose_service')
+        ->get();
+    expect($inactiveReplicas)->toHaveCount(2);
+    $inspections = $inactiveReplicas->map(
+        static fn (ApplicationBlueGreenReplica $replica): BlueGreenReplicaInspection => BlueGreenReplicaInspection::fromRuntime(
+            replicaIndex: $replica->replica_index,
+            composeService: $replica->compose_service,
+            containerName: $replica->container_name,
+            dockerId: $replica->container_id,
+            status: ContainerStatusTypes::EXITED->value,
+            health: 'healthy',
+        ),
+    )->values()->all();
+    InspectBlueGreenContainer::shouldRun()
+        ->andReturnUsing(static fn (Server $server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection => new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectation->dockerId,
+            status: ContainerStatusTypes::EXITED->value,
+            health: 'healthy',
+        ));
+    $payloads = [];
+    $archiveRequested = false;
+    $journalPresent = true;
+    $journalScriptsReplayed = false;
+    $freshMutationApplied = false;
+    $regeneratedMutationTargetsOnlyRunningReplica = false;
+    fakePendingExpectedSidecarReplicaRetirementRemote(
+        $payloads,
+        $archiveRequested,
+        $journalPresent,
+        $journalScriptsReplayed,
+        $freshMutationApplied,
+        $regeneratedMutationTargetsOnlyRunningReplica,
+        $expectedState,
+        $replacementState,
+        $state->inactive_retirement_server_boot_id,
+        $state->inactive_retirement_deployment_uuid,
+        blueGreenInactiveRetirementReplicaInspectionOutput($application, $state, $inspections),
+        blueGreenInactiveRetirementActiveReplicaInspectionOutput($application, $state, $owner),
+        $inactiveReplicas->firstOrFail()->container_id,
+        $inactiveReplicas->last()->container_id,
+    );
+
+    $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    $recoveredState = $state->fresh();
+    $recoveredReplicas = $inactiveReplicas->map->fresh();
+
+    expect($result)->toBe(RetireBlueGreenInactiveContainer::COMPLETED)
+        ->and($archiveRequested)->toBeTrue()
+        ->and($journalPresent)->toBeFalse()
+        ->and($journalScriptsReplayed)->toBeFalse()
+        ->and($freshMutationApplied)->toBeFalse()
+        ->and($recoveredState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($recoveredState->inactive_retirement_stopped_at)->not->toBeNull()
+        ->and($recoveredReplicas->every(
+            static fn (ApplicationBlueGreenReplica $replica): bool => $replica->health_status === 'stopped'
+                && $replica->last_observed_at !== null,
+        ))->toBeTrue();
+});
+
 it('fails closed when recovery cannot prove an inactive replica exact Compose slot', function (string $recoveryPath, string $failure): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirementWithV3ActiveContainerSet();
     prepareBlueGreenInactiveRetirementRemote($application->destination->server);
@@ -3375,7 +3463,7 @@ it('converges a retirement whose rehydration is fenced by its own pending drain 
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
     prepareBlueGreenInactiveRetirementRemote($application->destination->server);
     $state->update([
-        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_intervention_required_at' => now(),
         'destination_routing_topology_digest' => null,
     ]);
     $state = $state->fresh();
@@ -3457,6 +3545,428 @@ it('converges a retirement whose rehydration is fenced by its own pending drain 
     expect($claim->deploymentUuid)->toBe($successor->deployment_uuid)
         ->and($claimedState->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($claimedState->inactive_retirement_owner_deployment_uuid)->toBeNull();
+});
+
+it('completes an owner-exact stopped legacy retirement without rehydrating its null topology digest', function (): void {
+    ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $state->update([
+        'destination_routing_topology_digest' => null,
+        'inactive_retirement_stopped_at' => now(),
+    ]);
+    Process::fake();
+
+    expect(RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toBe(RetireBlueGreenInactiveContainer::COMPLETED)
+        ->and($state->fresh()->destination_routing_topology_digest)->toBeNull();
+    Process::assertNothingRan();
+});
+
+it('returns stale when normal topology-digest rehydration loses its operation fence', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $state->update(['destination_routing_topology_digest' => null]);
+    $state = $state->fresh();
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $lifecycleLockKey = BlueGreenDeploymentLock::key($application->id, $application->destination->id);
+    $replacementLock = null;
+    $lostFence = false;
+    Exceptions::fake();
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $lifecycleLockKey,
+        &$lostFence,
+        &$replacementLock,
+    ): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            Cache::lock($lifecycleLockKey, 1)->forceRelease();
+            $replacementLock = Cache::lock($lifecycleLockKey, 60);
+            expect($replacementLock->get())->toBeTrue();
+            $lostFence = true;
+
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+
+    try {
+        $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    } finally {
+        $replacementLock?->release();
+    }
+
+    $staleState = $state->fresh();
+    expect($lostFence)->toBeTrue()
+        ->and($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($staleState->destination_routing_topology_digest)->toBeNull()
+        ->and($staleState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($staleState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($owner->fresh()->logs)->toBeNull();
+    Exceptions::assertNothingReported();
+});
+
+it('returns stale when pending-journal topology-digest rehydration loses its operation fence', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $state->update(['destination_routing_topology_digest' => null]);
+    $state = $state->fresh();
+    $interventionAt = $state->inactive_retirement_intervention_required_at
+        ?? throw new RuntimeException('The pending-journal fixture requires an existing intervention marker.');
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $lifecycleLockKey = BlueGreenDeploymentLock::key($application->id, $application->destination->id);
+    $replacementLock = null;
+    $lostFence = false;
+    Exceptions::fake();
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $lifecycleLockKey,
+        &$lostFence,
+        &$replacementLock,
+    ): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            Cache::lock($lifecycleLockKey, 1)->forceRelease();
+            $replacementLock = Cache::lock($lifecycleLockKey, 60);
+            expect($replacementLock->get())->toBeTrue();
+            $lostFence = true;
+
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+
+    try {
+        $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    } finally {
+        $replacementLock?->release();
+    }
+
+    $staleState = $state->fresh();
+    expect($lostFence)->toBeTrue()
+        ->and($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($staleState->destination_routing_topology_digest)->toBeNull()
+        ->and($staleState->inactive_retirement_intervention_required_at?->equalTo($interventionAt))->toBeTrue()
+        ->and($staleState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($owner->fresh()->logs)->toBeNull();
+    Exceptions::assertNothingReported();
+});
+
+it('returns stale without diagnostics when marked pending-journal rehydration loses its retirement fence', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $state->update(['destination_routing_topology_digest' => null]);
+    $state = $state->fresh();
+    $interventionAt = $state->inactive_retirement_intervention_required_at
+        ?? throw new RuntimeException('The marked pending-journal fixture requires an existing intervention marker.');
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $lifecycleLockKey = BlueGreenDeploymentLock::key($application->id, $application->destination->id);
+    $replacementLock = null;
+    $lostFence = false;
+    Exceptions::fake();
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $lifecycleLockKey,
+        &$lostFence,
+        &$replacementLock,
+    ): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            Cache::lock($lifecycleLockKey, 1)->forceRelease();
+            $replacementLock = Cache::lock($lifecycleLockKey, 60);
+            expect($replacementLock->get())->toBeTrue();
+            $lostFence = true;
+
+            return Process::result(errorOutput: 'pending journal inspection transport failed', exitCode: 255);
+        }
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()->never();
+
+    try {
+        $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    } finally {
+        $replacementLock?->release();
+    }
+
+    $staleState = $state->fresh();
+    expect($lostFence)->toBeTrue()
+        ->and($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($staleState->destination_routing_topology_digest)->toBeNull()
+        ->and($staleState->inactive_retirement_intervention_required_at?->equalTo($interventionAt))->toBeTrue()
+        ->and($staleState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($owner->fresh()->logs)->toBeNull();
+    Exceptions::assertNothingReported();
+});
+
+it('reports raw pending-journal rehydration failures without disclosing privileged stderr', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $state->update([
+        'inactive_retirement_intervention_required_at' => now(),
+        'destination_routing_topology_digest' => null,
+    ]);
+    $state = $state->fresh();
+    makeBlueGreenInactiveRetirementDeployment($application);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The pending rehydration disclosure fixture requires an exact expected route state.');
+    $replacementState = $expectedState->withMutationOwner($owner->deployment_uuid);
+    $steadyStatePlan = PlanBlueGreenSteadyState::run(
+        $application,
+        $application->destination,
+        $state,
+    );
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        (string) $expectedState->activeDeploymentUuid,
+    );
+    $payloads = [];
+    $archiveRequested = false;
+    $journalPresent = true;
+    $journalScriptsReplayed = false;
+    fakePendingExpectedSidecarInactiveRetirementRemote(
+        $payloads,
+        $archiveRequested,
+        $journalPresent,
+        $journalScriptsReplayed,
+        $expectedState,
+        $replacementState,
+        $state->inactive_retirement_server_boot_id,
+        publicAcknowledgement: $steadyStatePlan->publicAcknowledgement,
+        releaseProof: $releaseProof,
+        destinationNetwork: $application->destination->network,
+    );
+    $marker = 'ssh: root@10.66.0.99 PRIVILEGED-INACTIVE-RETIREMENT-REHYDRATION-STDERR-MARKER docker inspect permission denied';
+    Exceptions::fake();
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andThrow(new RuntimeException($marker));
+
+    $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+
+    $rejectedState = $state->fresh();
+    $logs = (string) $owner->fresh()->logs;
+    $correlationMatches = [];
+    expect(preg_match('/reason=transition_failure correlation_id=([a-f0-9-]{36})/', $logs, $correlationMatches))
+        ->toBe(1);
+    $correlationId = $correlationMatches[1] ?? throw new RuntimeException('The pending rehydration failure log requires a correlation ID.');
+    expect($result)->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
+        ->and($rejectedState->inactive_retirement_owner_deployment_uuid)->toBe($owner->deployment_uuid)
+        ->and($rejectedState->inactive_retirement_supersession_generation)->toBe(2)
+        ->and($rejectedState->inactive_retirement_intervention_required_at)->not->toBeNull()
+        ->and($rejectedState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($rejectedState->destination_routing_topology_digest)->toBeNull()
+        ->and($logs)->not->toContain($marker, '10.66.0.99');
+    Exceptions::assertReported(function (BlueGreenDeploymentTransitionException $reported) use ($correlationId, $marker): bool {
+        return $reported->getMessage() === "reason=transition_failure correlation_id={$correlationId}"
+            && $reported->getPrevious()?->getMessage() === 'The pending inactive-retirement journal could not rehydrate its destination topology digest.'
+            && $reported->getPrevious()?->getPrevious()?->getMessage() === $marker;
+    });
+});
+
+it('reports raw terminal-attestation failures without disclosing privileged stderr', function (): void {
+    ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $marker = 'ssh: root@10.66.0.99 PRIVILEGED-INACTIVE-RETIREMENT-ATTESTATION-STDERR-MARKER docker inspect permission denied';
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    Exceptions::fake();
+    Process::fake(function (PendingProcess $process) use ($bootId, $marker): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            return Process::result(errorOutput: $marker, exitCode: 255);
+        }
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::EXITED->value,
+            health: 'healthy',
+        ));
+
+    $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+
+    $rejectedState = $state->fresh();
+    $logs = (string) $owner->fresh()->logs;
+    $correlationMatches = [];
+    expect(preg_match('/reason=transition_failure correlation_id=([a-f0-9-]{36})/', $logs, $correlationMatches))
+        ->toBe(1);
+    $correlationId = $correlationMatches[1] ?? throw new RuntimeException('The terminal attestation failure log requires a correlation ID.');
+    expect($result)->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
+        ->and($rejectedState->inactive_retirement_owner_deployment_uuid)->toBe($owner->deployment_uuid)
+        ->and($rejectedState->inactive_retirement_supersession_generation)->toBe(2)
+        ->and($rejectedState->inactive_retirement_intervention_required_at)->not->toBeNull()
+        ->and($rejectedState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($logs)->not->toContain($marker, '10.66.0.99');
+    Exceptions::assertReported(function (BlueGreenDeploymentTransitionException $reported) use ($correlationId, $marker): bool {
+        return $reported->getMessage() === "reason=transition_failure correlation_id={$correlationId}"
+            && $reported->getPrevious()?->getMessage() === 'The inactive-retirement destination state could not be attested.'
+            && $reported->getPrevious()?->getPrevious()?->getMessage() === $marker;
+    });
+});
+
+it('returns stale when a scalar terminal-attestation transport failure loses the retirement fence', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $topologyDigest = $state->destination_routing_topology_digest;
+    $lifecycleLockKey = BlueGreenDeploymentLock::key($application->id, $application->destination->id);
+    $replacementLock = null;
+    $lostFence = false;
+    Exceptions::fake();
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $lifecycleLockKey,
+        &$lostFence,
+        &$replacementLock,
+    ): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            Cache::lock($lifecycleLockKey, 1)->forceRelease();
+            $replacementLock = Cache::lock($lifecycleLockKey, 60);
+            expect($replacementLock->get())->toBeTrue();
+            $lostFence = true;
+
+            return Process::result(errorOutput: 'terminal attestation transport failed', exitCode: 255);
+        }
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::EXITED->value,
+            health: 'healthy',
+        ));
+
+    try {
+        $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    } finally {
+        $replacementLock?->release();
+    }
+
+    $staleState = $state->fresh();
+    expect($lostFence)->toBeTrue()
+        ->and($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($staleState->destination_routing_topology_digest)->toBe($topologyDigest)
+        ->and($staleState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($staleState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($owner->fresh()->logs)->toBeNull();
+    Exceptions::assertNothingReported();
+});
+
+it('returns stale when a replica terminal-attestation transport failure loses the retirement fence', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state, 'inspections' => $inspections] = makeReadyBlueGreenInactiveReplicaRetirement([
+        ContainerStatusTypes::EXITED->value,
+        ContainerStatusTypes::DEAD->value,
+    ]);
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    $topologyDigest = $state->destination_routing_topology_digest;
+    $inspectionOutput = blueGreenInactiveRetirementReplicaInspectionOutput($application, $state, $inspections);
+    $lifecycleLockKey = BlueGreenDeploymentLock::key($application->id, $application->destination->id);
+    $replacementLock = null;
+    $lostFence = false;
+    Exceptions::fake();
+    Process::fake(function (PendingProcess $process) use (
+        $bootId,
+        $inspectionOutput,
+        $lifecycleLockKey,
+        &$lostFence,
+        &$replacementLock,
+    ): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            Cache::lock($lifecycleLockKey, 1)->forceRelease();
+            $replacementLock = Cache::lock($lifecycleLockKey, 60);
+            expect($replacementLock->get())->toBeTrue();
+            $lostFence = true;
+
+            return Process::result(errorOutput: 'terminal replica attestation transport failed', exitCode: 255);
+        }
+        if (str_contains($payload, 'coolify_replica_')) {
+            return Process::result(output: $inspectionOutput);
+        }
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()->never();
+
+    try {
+        $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    } finally {
+        $replacementLock?->release();
+    }
+
+    $staleState = $state->fresh();
+    $replicaRows = ApplicationBlueGreenReplica::query()
+        ->where('application_blue_green_deployment_id', $state->id)
+        ->where('deployment_uuid', $state->inactive_retirement_deployment_uuid)
+        ->get();
+    expect($lostFence)->toBeTrue()
+        ->and($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($staleState->destination_routing_topology_digest)->toBe($topologyDigest)
+        ->and($staleState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($staleState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($replicaRows->every(
+            static fn (ApplicationBlueGreenReplica $replica): bool => $replica->health_status === 'healthy',
+        ))->toBeTrue()
+        ->and($owner->fresh()->logs)->toBeNull();
+    Exceptions::assertNothingReported();
+});
+
+it('does not durably convert a terminal-attestation programming error into intervention', function (): void {
+    ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    $bootId = (string) $state->inactive_retirement_server_boot_id;
+    Process::fake(function (PendingProcess $process) use ($bootId): FakeProcessResult {
+        $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
+            ."\n".(string) $process->input;
+        if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            throw new TypeError('programming defect at attestation boundary');
+        }
+        if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
+            return Process::result(output: $bootId);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $state->inactive_retirement_container_id,
+            status: ContainerStatusTypes::EXITED->value,
+            health: 'healthy',
+        ));
+
+    expect(fn (): string => RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2))
+        ->toThrow(TypeError::class, 'programming defect at attestation boundary');
+    expect($state->fresh()->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($state->fresh()->inactive_retirement_stopped_at)->toBeNull()
+        ->and((string) $owner->fresh()->logs)->not->toContain('transition_failure');
 });
 
 it('reschedules a marked journal-free retirement whose exact inactive target is still running instead of wedging', function (): void {
@@ -3806,6 +4316,60 @@ it('queues a bounded retry when the inactive-container destination mutation resu
             && str_contains($remoteMessage, 'Error response from daemon: transport reset during stop');
     });
 });
+
+it('returns stale when an ambiguous mutation observation loses its compare-and-swap', function (array $drift): void {
+    ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    Exceptions::fake();
+    $staleSnapshot = $state->fresh();
+    $state->update($drift);
+    $action = new RetireBlueGreenInactiveContainer;
+    $method = new ReflectionMethod($action, 'recordAmbiguousMutation');
+
+    $result = $method->invoke(
+        $action,
+        $staleSnapshot,
+        $owner,
+        new BlueGreenAmbiguousDestinationMutationException('remote secret'),
+    );
+
+    expect($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($state->fresh()->inactive_retirement_attempts)->toBe($drift['inactive_retirement_attempts'] ?? 0)
+        ->and((string) $owner->fresh()->logs)->not->toContain('ambiguous_mutation', 'remote secret');
+    Exceptions::assertNothingReported();
+})->with([
+    'attempts drift' => [['inactive_retirement_attempts' => 1]],
+    'retirement stopped' => [['inactive_retirement_stopped_at' => now()]],
+    'intervention required' => [['inactive_retirement_intervention_required_at' => now()]],
+]);
+
+it('returns stale without reporting when a transition failure loses its intervention compare-and-swap', function (array $drift): void {
+    ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
+    Exceptions::fake();
+    $staleSnapshot = $state->fresh();
+    $state->update($drift);
+    $action = new RetireBlueGreenInactiveContainer;
+    $method = new ReflectionMethod($action, 'markIntervention');
+
+    $result = $method->invoke(
+        $action,
+        $staleSnapshot,
+        $owner,
+        'stable transition failure',
+        new BlueGreenDeploymentTransitionException('privileged stale failure'),
+    );
+
+    $persistedState = $state->fresh();
+    expect($result)->toBe(RetireBlueGreenInactiveContainer::STALE)
+        ->and($persistedState->inactive_retirement_stopped_at !== null)->toBe(array_key_exists('inactive_retirement_stopped_at', $drift))
+        ->and($persistedState->inactive_retirement_intervention_required_at !== null)->toBe(array_key_exists('inactive_retirement_intervention_required_at', $drift))
+        ->and($persistedState->inactive_retirement_stopped_at !== null
+            && $persistedState->inactive_retirement_intervention_required_at !== null)->toBeFalse()
+        ->and((string) $owner->fresh()->logs)->not->toContain('transition_failure', 'privileged stale failure');
+    Exceptions::assertNothingReported();
+})->with([
+    'retirement stopped' => [['inactive_retirement_stopped_at' => now()]],
+    'intervention required' => [['inactive_retirement_intervention_required_at' => now()]],
+]);
 
 it('marks intervention with a stable correlation identifier once the ambiguous mutation budget is exhausted', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
