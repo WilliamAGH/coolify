@@ -1,6 +1,8 @@
 <?php
 
 use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
+use App\Actions\Application\BlueGreen\BlueGreenReconciliationResult;
+use App\Actions\Application\BlueGreen\ReconcileBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\CancelApplicationDeployment;
 use App\Enums\ApplicationDeploymentStatus;
@@ -139,6 +141,32 @@ it('keeps privileged remote failure detail out of the public stale-journal recov
     $appLog = File::get($this->appLogPath);
     expect($appLog)->toContain('PRIVILEGED-RECOVERY-STDERR-MARKER-9f4c')
         ->and($appLog)->toContain($result->correlationId);
+});
+
+it('persists and returns only a stable reconciliation failure reason with a correlation id', function (): void {
+    $scenario = BlueGreenRecoveryScenario::create(finalized: false, routingMutationRecorded: false);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FAILED->value,
+        'finished_at' => now(),
+    ]);
+    Process::fake(fn () => Process::result(errorOutput: recoveryDisclosureMarker(), exitCode: 255));
+
+    $result = ReconcileBlueGreenDeployment::run(
+        $scenario->state,
+        staleAfterSeconds: 1,
+        ignoreQueueActivity: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenReconciliationResult::INTERVENTION_REQUIRED)
+        ->and($result->message)->toStartWith('The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: ')
+        ->and($result->message)->not->toContain('PRIVILEGED-RECOVERY-STDERR-MARKER-9f4c')
+        ->and($result->message)->not->toContain('10.66.0.99')
+        ->and(str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString())->toBeUuid()
+        ->and($scenario->state->fresh()->intervention_reason)->toBe($result->message);
+
+    $appLog = File::get($this->appLogPath);
+    expect($appLog)->toContain('PRIVILEGED-RECOVERY-STDERR-MARKER-9f4c')
+        ->and($appLog)->toContain(str($result->message)->afterLast('Correlation ID: ')->rtrim('.')->toString());
 });
 
 it('keeps exception detail out of the emergency recovery API failure response', function (): void {

@@ -18,6 +18,8 @@ use App\Models\ApplicationBlueGreenReplica;
 use App\Models\ApplicationDeploymentQueue;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Lorisleiva\Actions\Concerns\AsAction;
 use Throwable;
 
@@ -328,12 +330,18 @@ final class ReconcileBlueGreenDeployment
         } catch (Throwable $exception) {
             try {
                 $operationFence->assertLockOwnership();
+                $correlationId = (string) Str::uuid();
+                Log::error('Blue-green reconciliation failed while proving a privileged recovery operation.', [
+                    'correlation_id' => $correlationId,
+                    'state_id' => $stateId,
+                    'exception' => $exception,
+                ]);
 
                 return $this->markOrDefer(
                     $stateId,
                     $expectedOperationUuid,
                     $expectedGeneration,
-                    'The interrupted operation could not be proven safe to reconcile: '.$exception->getMessage(),
+                    "The interrupted operation could not be proven safe to reconcile. Reason code: reconciliation_failed. Correlation ID: {$correlationId}.",
                 );
             } catch (BlueGreenOperationFenceLostException) {
                 return new BlueGreenReconciliationResult(
