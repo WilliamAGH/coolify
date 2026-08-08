@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Finalize terminal retirement journals safely
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.81-fork
+
 ## [4.13.80-fork] - 2026-08-08
 
 ### 🐛 Bug Fixes
