@@ -26,22 +26,26 @@ class StartService
         $service->saveComposeConfigs();
         $service->isConfigurationChanged(save: true);
         $workdir = $service->workdir();
+        $composeFile = "{$workdir}/docker-compose.yml";
+        $safeWorkdir = escapeshellarg($workdir);
+        $safeComposeFile = escapeshellarg($composeFile);
+        $safeProjectName = escapeshellarg($service->uuid);
         // $commands[] = "cd {$workdir}";
-        $commands[] = "echo 'Saved configuration files to {$workdir}.'";
+        $commands[] = 'echo '.escapeshellarg("Saved configuration files to {$workdir}.");
         // Ensure .env exists in the correct directory before docker compose tries to load it
         // This is defensive programming - saveComposeConfigs() already creates it,
         // but we guarantee it here in case of any edge cases or manual deployments
-        $commands[] = "touch {$workdir}/.env";
+        $commands[] = 'touch '.escapeshellarg("{$workdir}/.env");
         if ($pullLatestImages) {
             $commands[] = "echo 'Pulling images.'";
-            $commands[] = "docker compose --project-directory {$workdir} pull";
+            $commands[] = "docker compose --project-directory {$safeWorkdir} pull";
         }
         if ($service->networks()->count() > 0) {
             $commands[] = "echo 'Creating Docker network.'";
-            $commands[] = "docker network inspect $service->uuid >/dev/null 2>&1 || docker network create --attachable $service->uuid";
+            $commands[] = "docker network inspect {$safeProjectName} >/dev/null 2>&1 || docker network create --attachable {$safeProjectName}";
         }
         $commands[] = 'echo Starting service.';
-        $commands[] = "docker compose --project-directory {$workdir} -f {$workdir}/docker-compose.yml --project-name {$service->uuid} up -d --remove-orphans --force-recreate --build";
+        $commands[] = "docker compose --project-directory {$safeWorkdir} -f {$safeComposeFile} --project-name {$safeProjectName} up -d --remove-orphans --force-recreate --build";
         if (data_get($service, 'connect_to_docker_network')) {
             $compose = data_get($service, 'docker_compose', []);
             $safeNetwork = escapeshellarg($service->destination->network);
