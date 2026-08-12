@@ -2,7 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.84-fork] - 2026-08-12
+
+### 🐛 Bug Fixes
+
+- *(docker)* Make worker-disable gates immune to activation .env staging race
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.84-fork
+
+## [4.13.83-fork] - 2026-08-12
+
+### 📚 Documentation
+
+- *(operations)* Restore takeover runbook contract; split sf0 recovery doc
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.83-fork
+
+## [4.13.82-fork] - 2026-08-12
 
 ### 🐛 Bug Fixes
 
