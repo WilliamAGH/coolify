@@ -1,8 +1,11 @@
-#!/bin/sh
+#!/command/with-contenv sh
 
-cd /var/www/html
+cd /var/www/html || exit 1
 
-if grep -qE '^SCHEDULER_ENABLED=false' .env 2>/dev/null; then
+# The container environment (baked from env_file at creation) is checked
+# first because the bind-mounted .env can be rewritten by release staging
+# while s6 starts this service; either source saying false disables the scheduler.
+if [ "${SCHEDULER_ENABLED:-}" = "false" ] || grep -qE '^SCHEDULER_ENABLED=false' .env 2>/dev/null; then
     echo "   INFO  Scheduler is disabled, sleeping."
     exec sleep infinity
 fi

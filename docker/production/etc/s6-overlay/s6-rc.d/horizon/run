@@ -1,8 +1,11 @@
-#!/bin/sh
+#!/command/with-contenv sh
 
-cd /var/www/html
+cd /var/www/html || exit 1
 
-if grep -qE '^HORIZON_ENABLED=false' .env 2>/dev/null; then
+# The container environment (baked from env_file at creation) is checked
+# first because the bind-mounted .env can be rewritten by release staging
+# while s6 starts this service; either source saying false disables Horizon.
+if [ "${HORIZON_ENABLED:-}" = "false" ] || grep -qE '^HORIZON_ENABLED=false' .env 2>/dev/null; then
     echo "   INFO  Horizon is disabled, sleeping."
     exec sleep infinity
 fi
