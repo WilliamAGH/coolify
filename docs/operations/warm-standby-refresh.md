@@ -1,283 +1,190 @@
-# Warm standby refresh and takeover
+# popos-sf0 Coolify release staging recovery
 
-Repeatable, repository-versioned procedure for refreshing the warm standby
-(`popos-sf0`) from the running production control plane (`22.haiku.host`)
-without a production stop window, and for taking the standby over as the
-production control plane if that ever becomes necessary.
+## Scope and verified state
 
-This replaces the hand-preserved schema-v1 copies at
-`/root/control-plane-migrate.sh.v1-live-capture`. Once a refresh has been
-completed with the repository-versioned tool, delete those copies on **both**
-hosts (see "Retiring the v1 copies" below).
+As verified on 2026-08-11, `22.haiku.host` remains the one canonical
+production control-plane host, served at `https://coolify.haiku.host`.
+`popos-sf0` is being converted in place into the Coolify fork's dev and
+release-staging endpoint at `https://dev.coolify.haiku.host`.
 
-Tooling: `scripts/control-plane-migrate.sh` (manifest schema
-`coolify-control-plane-migration/2`) with the `--live-standby-seed` capture
-mode. The script is standalone: copy the single file to the host and run it
-with bash; it needs only docker, coreutils, tar, sha256sum, flock, and python3
-(for atomic no-replace publication). It is architecture-neutral — the arm64
-source (`22.haiku.host`) and amd64 standby (`popos-sf0`) interoperate because
-the database travels as a PostgreSQL custom-format dump and trees travel as
-tar archives; no host binaries are copied.
+This is an ingress and control-plane-state recovery, not a fresh installation,
+database rebuild, or production takeover. Do not destroy sf0, wipe its state,
+or infer that copied records mean a workload was missed during migration. The
+2026-08-11 audit found copied production rows to be metadata residue: there
+was no evidence of an sf0-only active server, destination container, managed
+route, service, or database that failed to migrate to the canonical plane.
 
-## Guarantee model
+The DNS A record for `dev.coolify.haiku.host` points at sf0's public address
+(`75.8.210.180`). DNS is not the current fault. The existing Coolify app is
+healthy on its direct host port 8000; sf0 lacked a working 80/443 ingress.
 
-A `--live-standby-seed` capture keeps the source running. Exactly one of
-`--require-source-stopped` or `--live-standby-seed` must be passed; the modes
-are mutually exclusive and freeform `--attest-quiesced` attestations remain
-rejected.
+## Cause of the failed ingress
 
-What a live standby seed **may** claim (recorded in `manifest.env` and
-`manifest.json` as `CAPTURE_MODE=live-standby-seed`,
-`CONTROL_PLANE_STATE_CONTRACT=live-standby-seed-unverified`, plus the
-guarantee text):
+sf0 retained a copied `control_plane_proxy_enrollment` in the `enrolled`
+phase for the production control plane. That stale enrollment made the proxy
+Compose configuration publish host port 8000 and add Traefik's `coolify`
+entrypoint on port 8000. The already-running sf0 `coolify` app also owns host
+port 8000. Consequently, the never-started `coolify-proxy` container remained
+in `Created` state and failed with a host-port collision.
 
-- The database dump is transactionally consistent (single `pg_dump` snapshot).
-- Tree archives are crash-consistent and were taken while both canonical
-  control-plane writer locks were held (no concurrent enrollment writer could
-  mutate the proxy tree during the copy).
-- `APP_KEY` is present and checksums cover every artifact.
-- The capture is read-only with respect to the running source: no containers
-  are stopped or started, no compose changes are made, and `--capture-redis`
-  is refused in this mode because `BGSAVE` would mutate source state. The only
-  source-filesystem writes are the two canonical writer-lock files (only if
-  absent) and the designated `--output` directory.
+This mixed state also prevents the ordinary dynamic-proxy owner from doing its
+job: while a non-rolled-back enrollment exists, `Server::setupDynamicProxyConfiguration()`
+does not generate the normal instance route. The recovery is therefore to
+fence and clear the copied enrollment state, restore the ordinary proxy shape,
+and let that owner generate the staging route. It is not to move the app off
+8000, add a second proxy, hand-write a parallel route, or reactivate the
+production enrollment.
 
-What it **may not** claim:
+## Required boundaries
 
-- The absent control-plane state contract. The source keeps running, so the
-  archive may carry durable control-plane state (enrollment / generation rows,
-  the listener override, managed Traefik writer state) and no fingerprint
-  stability is asserted.
-- Coherence between the trees and the database, or queue/job coherence. Redis
-  is never captured in this mode.
+- Do not change, seed, stop, fail over, or route traffic to
+  `22.haiku.host` as part of this work. Its production hostname is
+  `coolify.haiku.host`.
+- Do not delete or selectively sanitize sf0's copied database, Redis state,
+  proxy tree, keys, applications, services, or server records. The verified
+  conversion is in place.
+- Do not run a broad Compose lifecycle command. The only container this
+  recovery may remove, recreate, and start is `coolify-proxy`, because it was
+  created but never started. Preserve the running `coolify`, database, Redis,
+  Sentinel, and auxiliary containers.
+- Do not copy production `acme.json`, manually author a dynamic proxy route,
+  or introduce another ingress implementation. Coolify's existing
+  `coolify-proxy` remains the sole 80/443 ingress owner.
+- Do not treat the recovered endpoint as fully isolated until the limitation
+  below has been resolved by an operator-owned lifecycle action.
 
-Consequences enforced by the tool:
+## Current automation and lifecycle limitation
 
-- Restore of a live-seed archive refuses `--enable-workers` outright; a
-  production takeover requires this runbook, never a flag.
-- `--restore-proxy` is refused for every schema-v2 archive.
-- Restore tolerates durable control-plane **database** state on the standby
-  target (its database is dropped and re-seeded; a second refresh must not be
-  blocked by rows the first refresh imported) while the standby's own
-  **filesystem** must stay free of control-plane listener/writer state.
+The following database controls are disabled on sf0: Sentinel enablement
+booleans, scheduled database backups, scheduled tasks, and email/Resend
+delivery. Team notification transports are disabled as well. Those settings
+prevent their automatic recreation or dispatch after a future lifecycle
+operation; they do not change environment variables or processes already
+inside running containers.
 
-## Preconditions
+In particular, `coolify-sentinel` is still running with a production
+`PUSH_ENDPOINT`. The existing app container's Horizon, scheduler, and SSH
+master processes likewise remain tied to that already-running container.
+Correcting either condition requires stopping or recreating an existing
+container. The agent process rule forbids that action; it is reserved for an
+operator-owned lifecycle change. Even after ingress recovery, sf0 must not be
+described as fully isolated or as a clean/fresh staging installation.
 
-- The standby is fork-deploy managed and `fork-deploy verify` is green.
-- The standby runs the **same fork release and image digest** as production
-  (restore proves `--expect-fork-version` and `--expect-image-digest`).
-- The standby's filesystem carries no control-plane listener override
-  (`source/docker-compose.control-plane-listener.yml`) or managed Traefik
-  writer state beyond the two canonical lock files.
-- Workers are disabled on the standby (`HORIZON_ENABLED=false`,
-  `SCHEDULER_ENABLED=false`) and no router or ACME entry exists for the
-  production hostname.
-- `/data/coolify/proxy` on the standby is root-owned (restore fails closed
-  otherwise). The v1 seeding left it owned by uid 9999; match production
-  before the first restore:
+## In-place recovery procedure
 
-  ```bash
-  chown root:9999 /data/coolify/proxy && chmod 710 /data/coolify/proxy
-  ```
+Record every command, container ID, file hash, and result in the recovery
+ticket. Stop at any unexpected state rather than broadening the operation.
 
-## Refresh procedure
+### 1. Preserve rollback evidence
 
-Run every step as root. Placeholders: `<STAMP>` is a UTC timestamp you choose
-once and reuse; `<X.Y.Z-fork>` and `sha256:<digest>` come from the standby
-itself in step 4.
+Before changing state, make and retain all of the following outside the live
+proxy directory:
 
-1. **Ship the tool to both hosts** (from a repository checkout):
+1. A timestamped, encrypted database dump, with its checksum.
+2. The exact current bytes and checksum of
+   `/data/coolify/proxy/docker-compose.yml`.
+3. The current proxy dynamic configuration, if present, plus `acme.json`
+   metadata and the `coolify-proxy` inspect output.
+4. The running `coolify` container ID and its published port mapping, proving
+   that the recovery must preserve its direct port-8000 ownership.
 
-   ```bash
-   scp scripts/control-plane-migrate.sh root@22.haiku.host:/root/control-plane-migrate.sh
-   scp scripts/control-plane-migrate.sh root@popos-sf0:/root/control-plane-migrate.sh
-   ```
+Name the retained evidence in the ticket as `SF0_RECOVERY_DUMP` and
+`SF0_RECOVERY_PROXY_COMPOSE`. They are the rollback references for this
+operation. A database dump is forensic/recovery evidence; never restore it
+blindly over a running control plane.
 
-2. **Capture on the source (production keeps running)** — on `22.haiku.host`:
+### 2. Fence the copied enrollment state
 
-   ```bash
-   STAMP=$(date -u +%Y%m%d%H%M%S)
-   bash /root/control-plane-migrate.sh capture \
-     --output /data/coolify/control-plane-migrate-standby-seed-$STAMP \
-     --live-standby-seed
-   echo $STAMP
-   ```
+Confirm the disabled automation controls above and record their values. Then,
+using Coolify's control-plane proxy state owner, clear only the stale,
+production-derived enrollment for sf0's local server (`server_id = 0`). The
+clear must be bounded to the copied enrollment state and occur only after the
+backup in step 1. It must not delete resource inventory, users, teams, keys,
+or instance settings.
 
-   If the census reports an undecided top-level directory under
-   `/data/coolify`, decide it explicitly with `--include NAME` or
-   `--exclude NAME` and re-run; the tool never guesses. Do not pass
-   `--capture-redis` (refused in this mode) and do not stop anything.
+The fence is complete only when the server no longer has a non-rolled-back
+control-plane enrollment that blocks normal dynamic proxy generation. Preserve
+the removed state in `SF0_RECOVERY_DUMP` rather than reconstructing it by hand.
 
-   Decisions made on the first refresh (2026-07-30), as the reference set:
-   `--exclude control-plane-attestor` (control-plane proxy attestor
-   workspaces; must never travel to a standby), `--exclude sentinel`
-   (actively written host-local metrics sqlite; meaningless off-host),
-   `--include log-drains --include ssl --include webhooks-during-maintenance`
-   (ordinary instance data). Re-evaluate any new undecided directory on its
-   own merits.
+### 3. Restore the ordinary proxy Compose shape
 
-3. **Transfer to the standby** — on `popos-sf0`:
+Generate the ordinary proxy configuration with
+`generateDefaultProxyConfiguration($server, save: false)` and persist it
+through `SaveProxyConfiguration`; do not reuse the enrollment-modified stored
+configuration or hand-edit the file. The ordinary proxy configuration publishes:
 
-   ```bash
-   rsync -a --info=progress2 \
-     root@22.haiku.host:/data/coolify/control-plane-migrate-standby-seed-<STAMP>/ \
-     /data/coolify/control-plane-migrate-standby-seed-<STAMP>/
-   ```
-
-   If host-to-host SSH is not authorized (neither host holds a key for the
-   other — the state observed on the first refresh), relay the archive
-   through the operator machine with a tar pipe instead; step 4's `verify`
-   re-checks every artifact checksum on the target, so the relay adds no
-   integrity risk:
-
-   ```bash
-   ssh root@22.haiku.host \
-     'tar -C /data/coolify -cf - control-plane-migrate-standby-seed-<STAMP>' \
-     | ssh root@popos-sf0 'tar -C /data/coolify -xf -'
-   ```
-
-4. **Verify the archive and read the standby's release identity** — on
-   `popos-sf0`:
-
-   ```bash
-   bash /root/control-plane-migrate.sh verify \
-     --archive /data/coolify/control-plane-migrate-standby-seed-<STAMP>
-   grep '^COOLIFY_FORK_VERSION=' /data/coolify/source/.env
-   grep -o 'coolify@sha256:[a-f0-9]\{64\}' /data/coolify/source/docker-compose.custom.yml
-   ```
-
-   Verify prints the reduced-guarantee line for live archives; that is
-   expected.
-
-5. **Restore without workers and without proxy** — on `popos-sf0`:
-
-   ```bash
-   bash /root/control-plane-migrate.sh restore \
-     --archive /data/coolify/control-plane-migrate-standby-seed-<STAMP> \
-     --authorize-overwrite "$(hostname)" \
-     --expect-fork-version <X.Y.Z-fork> \
-     --expect-image-digest sha256:<digest>
-   ```
-
-   Never pass `--enable-workers` (refused for live-seed archives) and never
-   pass `--restore-proxy` (refused by schema v2). The restore stops the
-   standby's app container, backs the standby up, re-seeds the database, and
-   restarts the app with workers disabled.
-
-   If restore fails closed with `effective APP_KEY mismatch`, the app
-   container must be recreated from its compose project. **Before any
-   `docker compose ... up` on the standby, verify the pinned coolify digest
-   matches the intended release** (pin-revert hazard — an unrelated writer has
-   previously rewritten the pin):
-
-   ```bash
-   grep -o 'coolify@sha256:[a-f0-9]\{64\}' /data/coolify/source/docker-compose.custom.yml
-   ```
-
-   Only proceed with the compose recreate if that digest equals the
-   `sha256:<digest>` you passed to restore, then re-run restore with a fresh
-   `--target-backup-dir`.
-
-6. **Reconcile release tracking and verify** — on `popos-sf0`:
-
-   Restore invokes `fork-deploy reconcile-migrated-state` automatically when
-   the tool is resolvable; if it logged that the tooling was not found, run it
-   yourself, then verify:
-
-   ```bash
-   fork-deploy reconcile-migrated-state
-   fork-deploy verify
-   ```
-
-   This form re-records only the migration fingerprint and rendered-Compose sha
-   and requires the running image digests to equal the **recorded** signed
-   release. If it refuses because the host is running a signed release that was
-   never recorded (releases applied by hand-swapping the Compose overlay), use
-   `fork-deploy-unrecorded-release-adoption.md` instead — it adopts the running
-   release only against an operator-supplied, signature-verified manifest.
-
-7. **Post-refresh checks** — on `popos-sf0`:
-
-   ```bash
-   grep -E '^(HORIZON_ENABLED|SCHEDULER_ENABLED)=' /data/coolify/source/.env   # both false
-   ```
-
-   Compare the post-restore inventory printed by restore against the manifest
-   inventory. Confirm no router and no ACME entry exists for the production
-   hostname (see the hazard below).
-
-## Cadence
-
-The refresh is **manual and scheduled by convention, not automation**: run it
-**weekly**, and additionally **before any risky control-plane change** on
-production (release rollouts that touch the control plane, proxy/enrollment
-changes, migrations). A standby seed older than two weeks should be treated as
-stale for takeover purposes. Automating the refresh is deliberately out of
-scope: capture holds production's control-plane writer locks, and an
-unattended failure mode that leaves preserved staging directories or a
-half-restored standby needs an operator anyway.
-
-## The instance_fqdn / ACME hazard
-
-The restored database carries `instance_fqdn = https://coolify.iocloudhost.net`
-(the production hostname). Nothing on the standby may generate a router for
-that hostname: workers stay disabled, no proxy configuration is restored, and
-`acme.json` stays empty. If the standby's dynamic proxy configuration were
-ever regenerated while it holds the production `instance_fqdn`, it would
-request ACME certificates for the production hostname and consume Let's
-Encrypt failure limits shared with production renewals.
-
-Concretely: never enable Horizon/the scheduler, never run proxy
-(re)generation, and never start a Traefik that would serve the production
-hostname on the standby during refresh. Stopping the standby's proxy container
-is **not** a valid hardening step either — the proxy is part of the verified
-Compose state, so stopping it turns `fork-deploy verify` red and its `repair`
-guidance re-activates the recorded release.
-
-## Takeover (promoting the standby to production)
-
-Takeover is a deliberate, operator-driven procedure. There must be **exactly
-one** mutable production control plane at any moment; enabling workers on the
-standby while the production plane can still run them is the one unrecoverable
-mistake this runbook exists to prevent.
-
-1. **Fence the old plane.** Confirm the production control plane on
-   `22.haiku.host` is stopped or unreachable and cannot restart its workers
-   (stop the app container and disable its compose stack, or confirm the host
-   is down). Record the decision and the data-loss window: the standby serves
-   the last seed, so everything after `CREATED_AT_UTC` in the seed's manifest
-   is lost.
-2. **Verify release identity on the standby** (`fork-deploy verify`, and check
-   the pinned digest in `/data/coolify/source/docker-compose.custom.yml`
-   matches the release you intend to run — pin-revert hazard, as above).
-3. **Reconcile imported control-plane state.** A live seed may have imported
-   durable enrollment / generation rows describing the dead plane's proxy
-   state. Roll back or reconcile that state (the enrollment/promotion
-   reconciliation procedures) before any blue/green operation runs on the new
-   plane.
-4. **Enable workers on exactly one plane.** On the standby set
-   `HORIZON_ENABLED=true` and `SCHEDULER_ENABLED=true` in
-   `/data/coolify/source/.env`, then recreate the app container from its
-   compose project (after the pin-digest check) so the environment takes
-   effect.
-5. **Move the hostname.** Point DNS for the `instance_fqdn`
-   (`coolify.iocloudhost.net`) at the standby. Only after DNS resolves to the
-   standby, regenerate the proxy configuration so Traefik obtains ACME
-   certificates for the hostname on the new plane. Dogfood with forced DNS
-   resolution before the public DNS change.
-6. **Re-verify.** `fork-deploy verify` green, public health checks green,
-   deployments and realtime working. The old host, if it ever returns, must
-   come back with workers disabled and must be treated as a standby candidate,
-   never as a second control plane.
-
-## Retiring the v1 copies
-
-The v1 live-capture script survives only as unversioned copies at
-`/root/control-plane-migrate.sh.v1-live-capture` on `22.haiku.host` and
-`popos-sf0`. It receives no review or tests and drifts from the supported
-tool. After the first successful refresh with `--live-standby-seed`:
-
-```bash
-ssh root@22.haiku.host rm -f /root/control-plane-migrate.sh.v1-live-capture
-ssh root@popos-sf0 rm -f /root/control-plane-migrate.sh.v1-live-capture
+```text
+80:80
+443:443
+443:443/udp
+127.0.0.1:8080:8080
 ```
+
+It must not publish host port 8000 and must not include
+`--entrypoints.coolify.address=:8000`. The direct Coolify app keeps its
+existing host-port-8000 binding. Retain the configured proxy image, volumes,
+networks, and other ordinary Compose fields unchanged.
+
+### 4. Generate the staging dynamic route through Coolify
+
+Set the instance FQDN to `https://dev.coolify.haiku.host` and give the
+instance an unambiguous name such as `Coolify Release Staging (sf0)` through
+the instance Settings owner. After the stale enrollment fence is clear,
+`Server::setupDynamicProxyConfiguration()` is the canonical owner that
+generates the managed `coolify.yaml` route for the dashboard, Reverb, and
+terminal endpoints.
+
+Verify the generated dynamic configuration contains
+`dev.coolify.haiku.host` and no `coolify.haiku.host`,
+`coolify.iocloudhost.net`, or other production control-plane hostname. Do not
+substitute a manual dynamic file for the owner-generated configuration.
+
+### 5. Start only the missing proxy
+
+Use the corrected existing proxy Compose project to remove/recreate, if
+needed, and start only `coolify-proxy`. Do not run a project-wide `up`,
+restart Docker, or stop/recreate any existing container. The expected result
+is that `coolify-proxy` binds 80/443 while `coolify` retains the same container
+identity and direct 8000 binding recorded in step 1.
+
+## Recovery acceptance checklist
+
+The in-place ingress recovery is accepted only when every item is evidenced:
+
+1. `22.haiku.host` and `https://coolify.haiku.host` are unchanged and remain
+   the production control plane.
+2. Public DNS for `dev.coolify.haiku.host` resolves to `75.8.210.180` and
+   HTTP redirects to HTTPS.
+3. TLS for `dev.coolify.haiku.host` is valid, and
+   `https://dev.coolify.haiku.host/login` reaches the sf0 login page.
+4. `coolify-proxy` is running and is the only sf0 listener on 80/443.
+5. The existing `coolify` container ID is unchanged and it still owns host
+   port 8000; no proxy listener or entrypoint claims that port.
+6. The generated dynamic configuration routes only
+   `dev.coolify.haiku.host`; it contains no production control-plane hostname.
+7. The stale local `control_plane_proxy_enrollment` is absent or explicitly
+   rolled back, so normal dynamic proxy generation is no longer suppressed.
+8. Database evidence shows Sentinel enablement, scheduled backups, scheduled
+   tasks, and email/Resend delivery disabled; team notification transports are
+   disabled.
+9. The recovery ticket contains valid `SF0_RECOVERY_DUMP` and
+   `SF0_RECOVERY_PROXY_COMPOSE` references, checksums, and the before/after
+   proxy inspection evidence.
+
+Passing this checklist establishes recovered staging ingress and disabled
+automations. It does not establish clean state, full isolation, or permission
+to enable lifecycle-bound workers. Those claims remain blocked by the running
+Sentinel and existing app process topology described above.
+
+## Rollback
+
+If the recovery fails before `coolify-proxy` starts, restore the exact proxy
+Compose bytes identified by `SF0_RECOVERY_PROXY_COMPOSE`, then stop and review
+the saved inspect output and logs. Do not start a second proxy or modify the
+running app's port-8000 binding.
+
+If a database-state rollback is considered, use `SF0_RECOVERY_DUMP` only in a
+new, explicitly authorized recovery plan. Restoring a production-derived dump
+can reintroduce copied enrollment and automation state, so it is not an
+automatic rollback step. A staging failure never authorizes a production DNS
+change, a production failover, or a lifecycle change on `22.haiku.host`.
