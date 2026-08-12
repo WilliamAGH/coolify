@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(server)* Restart proxy and sentinel after Docker daemon config restart
+- *(jobs)* Scope helper-container cleanup to owned deployments
+- *(services)* Shell-escape workdir, compose path, and project name in StartService
+
+### 📚 Documentation
+
+- Update changelog
+- *(operations)* Re-role sf0 from warm standby to isolated release staging
+
+### ⚙️ Miscellaneous Tasks
+
+- *(templates)* Refresh service catalog; disable registry OTEL exporter
+- *(release)* Prepare 4.13.82-fork
+
+## [4.13.81-fork] - 2026-08-08
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Finalize terminal retirement journals safely
 
 ### 📚 Documentation
