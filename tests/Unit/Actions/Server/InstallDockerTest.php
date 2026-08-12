@@ -53,7 +53,7 @@ namespace {
         $certificates->shouldReceive('exists')->andReturnTrue();
 
         $server = Mockery::mock(Server::class)->makePartial();
-        $server->id = 0;
+        $server->id = 42;
         $server->shouldReceive('validateOS')->andReturn(Str::of('debian'));
         $server->shouldReceive('sslCertificates')->andReturn($certificates);
         $server->shouldReceive('isSwarm')->andReturnFalse();
@@ -66,8 +66,13 @@ namespace {
         expect($daemonMutation)->toBeString()
             ->toContain(base64_encode(file_get_contents(base_path('scripts/install.sh'))))
             ->toContain('--configure-docker-daemon /etc/docker/daemon.json')
-            ->toContain('24 false false')
+            ->toContain('10.0.0.0/8 24 false false')
             ->toContain('if [ "$DAEMON_CONFIG_RESULT" = changed ]')
+            ->toContain('for COOLIFY_CONTAINER in coolify-proxy coolify-sentinel')
+            ->toContain("docker inspect --format='{{.State.Running}}'")
+            ->toContain('systemctl restart docker && for COOLIFY_CONTAINER in $COOLIFY_SOCKET_MOUNTERS')
+            ->toContain('docker restart "$COOLIFY_CONTAINER"')
+            ->not->toContain('10.42.0.0/16')
             ->not->toContain('daemon.json.appended')
             ->not->toContain('jq -s')
             ->not->toContain('| bash')
