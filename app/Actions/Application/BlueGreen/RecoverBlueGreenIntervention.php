@@ -120,6 +120,17 @@ final class RecoverBlueGreenIntervention
         return $this->correlationId ??= (string) Str::uuid();
     }
 
+    /**
+     * A refusal held back while a later profile may still claim this
+     * destination. Flushed the moment nothing claims it, and dropped when a
+     * later profile recovers -- an operator running this command during an
+     * incident must not be paged by the refusal of a profile that did not own
+     * the journal in the first place.
+     */
+    private ?\Closure $deferredRecoveryFailure = null;
+
+    private bool $defersRecoveryFailure = false;
+
     private function reportRecoveryFailure(
         \Throwable $exception,
         string $reasonCode,
@@ -133,15 +144,47 @@ final class RecoverBlueGreenIntervention
             'state_id' => $stateId,
             'deactivation_id' => $deactivationId,
         ];
+        $emit = function () use ($context, $exception): void {
+            Log::warning('Blue-green intervention recovery failed.', [
+                ...$context,
+                'exception' => $exception,
+            ]);
+            auditLog('blue_green.intervention.recovery_failed', $context, 'error');
+            report($exception);
+        };
+        if ($this->defersRecoveryFailure) {
+            // Keep only the first refusal: it is the one the operator is shown
+            // if nothing later claims the destination.
+            $this->deferredRecoveryFailure ??= $emit;
 
-        Log::warning('Blue-green intervention recovery failed.', [
-            ...$context,
-            'exception' => $exception,
-        ]);
-        auditLog('blue_green.intervention.recovery_failed', $context, 'error');
-        report($exception);
+            return $correlationId;
+        }
+        $emit();
 
         return $correlationId;
+    }
+
+    private function flushDeferredRecoveryFailure(): void
+    {
+        $deferred = $this->deferredRecoveryFailure;
+        $this->deferredRecoveryFailure = null;
+        $this->defersRecoveryFailure = false;
+        $deferred?->__invoke();
+    }
+
+    private function dropDeferredRecoveryFailure(int $stateId): void
+    {
+        $superseded = $this->deferredRecoveryFailure !== null;
+        $this->deferredRecoveryFailure = null;
+        $this->defersRecoveryFailure = false;
+        if (! $superseded) {
+            return;
+        }
+        auditLog('blue_green.intervention.recovery_superseded', [
+            'correlation_id' => $this->correlationId(),
+            'state_id' => $stateId,
+            'classification' => BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL,
+        ], 'info');
     }
 
     /**
@@ -277,6 +320,10 @@ final class RecoverBlueGreenIntervention
         ?string $successorDeploymentUuid,
         ?string $successorHorizonJobId,
     ): BlueGreenInterventionRecoveryResult {
+        // A refusal below is only provisional while this destination could
+        // still belong to the completed mutation profile, so its error-channel
+        // report waits until that is decided.
+        $this->defersRecoveryFailure = $this->mayDeferToCompletedContainerMutationJournal($stateId);
         $result = $this->recoverJournaledStaleContainerMutation(
             $stateId,
             $apply,
@@ -291,15 +338,37 @@ final class RecoverBlueGreenIntervention
         // profile to claim. A deferred or archived outcome is already one of
         // those profiles' answers and is never second-guessed here.
         if ($result->outcome !== BlueGreenInterventionRecoveryResult::MANUAL_ONLY) {
+            $this->flushDeferredRecoveryFailure();
+
             return $result;
         }
 
-        return $this->recoverCompletedContainerMutationJournal(
+        $completedMutation = $this->recoverCompletedContainerMutationJournal(
             $stateId,
             $apply,
             $reason,
             $successorQueueId,
-        ) ?? $result;
+        );
+        if ($completedMutation === null
+            || $completedMutation->outcome === BlueGreenInterventionRecoveryResult::MANUAL_ONLY) {
+            $this->flushDeferredRecoveryFailure();
+
+            return $completedMutation ?? $result;
+        }
+        $this->dropDeferredRecoveryFailure($stateId);
+
+        return $completedMutation;
+    }
+
+    private function mayDeferToCompletedContainerMutationJournal(int $stateId): bool
+    {
+        try {
+            return $this->isCompletedContainerMutationJournalCandidate(
+                $this->destinationRecoveryContext($stateId),
+            );
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     private function recoverJournaledStaleContainerMutation(

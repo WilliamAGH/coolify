@@ -1649,3 +1649,69 @@ it('reports its own probe failure instead of handing back an earlier profile ref
         ->and($result->correlationId)->not->toBeNull()
         ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
 });
+
+it('does not page an operator with an earlier profile refusal that the completed-mutation profile then resolved', function (): void {
+    $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $journalPresent = true;
+    $payloads = [];
+    fakeCompletedContainerMutationJournalRemote(
+        cleanIdleJournalStateWithOperation($expectedState, 'completed-mutation-predecessor'),
+        $expectedState,
+        $expectedState,
+        hash('sha256', 'completed-mutation-journal'),
+        (string) $scenario->deployment->blue_green_server_boot_id,
+        $payloads,
+        $journalPresent,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectedState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
+    $auditEvents = [];
+    captureCompletedContainerMutationAudit($auditEvents);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Prove a superseded refusal never reaches the error channel.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($auditEvents)->not->toHaveKey('blue_green.intervention.recovery_failed')
+        ->and($auditEvents)->toHaveKey('blue_green.intervention.recovery_superseded')
+        ->and($auditEvents)->toHaveKey('blue_green.stale_container_journal.completed_mutation_recovered');
+});
+
+it('still reports an earlier profile refusal when the completed-mutation profile does not resolve it', function (): void {
+    $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
+    // No journal on the host at all: the earlier profile's refusal is the
+    // operator's real answer and must reach the error channel intact.
+    Process::fake(function (PendingProcess $process): mixed {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (isCleanIdleBootIdentityRead($payload)) {
+            return Process::result(output: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
+        }
+
+        return Process::result();
+    });
+    $auditEvents = [];
+    captureCompletedContainerMutationAudit($auditEvents);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($auditEvents)->toHaveKey('blue_green.intervention.recovery_failed')
+        ->and($auditEvents)->not->toHaveKey('blue_green.intervention.recovery_superseded');
+});
