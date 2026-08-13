@@ -360,12 +360,18 @@ final class RecoverBlueGreenIntervention
             return $result;
         }
 
-        $completedMutation = $this->recoverCompletedContainerMutationJournal(
-            $stateId,
-            $apply,
-            $reason,
-            $successorQueueId,
-        );
+        try {
+            $completedMutation = $this->recoverCompletedContainerMutationJournal(
+                $stateId,
+                $apply,
+                $reason,
+                $successorQueueId,
+            );
+        } catch (\Throwable $exception) {
+            $this->flushDeferredRecoveryFailure();
+
+            throw $exception;
+        }
         // Only an outcome that actually resolves the destination supersedes the
         // held refusal. A deferred outcome resolves nothing — it is the shape
         // that leaves an archive unproven — so the refusal still stands and the
@@ -1034,9 +1040,13 @@ final class RecoverBlueGreenIntervention
             // observation left. The flag itself is the durable proof:
             // ResumeBlueGreenInactiveRetirements excludes every row that has
             // it, and an expired reservation proves no dispatch is in flight.
-            // The sample is still load-bearing for reconstructing the journal's
-            // own drain script, which branches only on zero, and the context
-            // builder already proved it is a non-negative integer.
+            // The sample stays load-bearing, but as evidence rather than as a
+            // gate: it selects which drain script recovery reconstructs, and
+            // the journal's own mutation checksum is what accepts or rejects
+            // that reconstruction on the host. A sample the retirement
+            // overwrote after writing the journal therefore still fails
+            // closed there, on the journal's bytes, instead of here on a
+            // durable value that never proved anything about liveness.
             if ($state->inactive_retirement_dispatch_reserved_until_at === null
                 || $this->inactiveRetirementDispatchReservationIsFuture($state)) {
                 throw new BlueGreenDeploymentTransitionException('A reserved inactive-retirement owner prevents stale-journal recovery.');
@@ -2335,23 +2345,29 @@ SH;
         ?\Throwable $exception = null,
         ?string $reasonCode = null,
     ): BlueGreenInterventionRecoveryResult {
-        $reasonCode ??= $exception === null ? null : $phase;
-        $correlationId = $exception === null
-            ? null
-            : $this->reportRecoveryFailure($exception, $reasonCode, $stateId);
-        $auditContext = ['phase' => $phase];
-        if ($reasonCode !== null) {
-            $auditContext['reason_code'] = $reasonCode;
-        }
-        if ($correlationId !== null) {
-            $auditContext['correlation_id'] = $correlationId;
-        }
+        // This is the gravest outcome the command produces: an archive reached
+        // the host and its result is unproven. Every one of them reaches the
+        // error channel under a correlation id, including the postcondition
+        // failures that carry no exception of their own — an operator must be
+        // able to find the record, and alerting must be able to fire on it.
+        $reasonCode ??= $phase;
+        $correlationId = $this->reportRecoveryFailure(
+            $exception ?? new BlueGreenDeploymentTransitionException(
+                "Stale-journal archival reached the host and its outcome could not be proven ({$phase}).",
+            ),
+            $reasonCode,
+            $stateId,
+        );
         $this->auditStaleContainerMutationJournal(
             'blue_green.stale_container_journal.archive_outcome_unknown',
             $stateId,
             $context,
             $reason,
-            $auditContext,
+            [
+                'phase' => $phase,
+                'reason_code' => $reasonCode,
+                'correlation_id' => $correlationId,
+            ],
         );
 
         return new BlueGreenInterventionRecoveryResult(

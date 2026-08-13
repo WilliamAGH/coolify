@@ -5587,12 +5587,13 @@ SH;
     ]));
 
     return [
+        // Mirrors staleInactiveRetirementJournalBootProfile() exactly. An
+        // authenticated fixture that models a stale predicate would refuse
+        // journals the shipped code accepts and pass for the wrong reason.
         'allow_pending_same_boot_journal' => $state->inactive_retirement_stopped_at === null
             && $state->inactive_retirement_intervention_required_at !== null
-            && $state->inactive_retirement_attempts === RetireBlueGreenInactiveContainer::MAX_ATTEMPTS
             && $state->inactive_retirement_dispatch_reserved_until_at !== null
             && ! $state->inactive_retirement_dispatch_reserved_until_at->isFuture()
-            && $state->inactive_retirement_last_observed_connections === 1
             && hash_equals($currentBootId, $journalBootId),
         'archive_filename' => sprintf(
             '.blue-green-stale-container-mutation-%s.state-%d.journal',
@@ -6266,9 +6267,16 @@ it('recovers an intervened retirement whose attempts never reached the retry bud
 
 /**
  * Seven of the eight escalation call sites never touch the connection sample,
- * so an intervened owner carries whatever its last observation left. Recovery
- * reads the sample only to reconstruct the journal's own drain script, which
- * branches on zero and nothing else, so every recorded value is recoverable.
+ * so an intervened owner carries whatever its last observation left, and the
+ * gate no longer refuses on the value.
+ *
+ * The sample still selects which drain script recovery reconstructs, and the
+ * journal's own mutation checksum accepts or rejects that reconstruction on the
+ * host -- so a sample the retirement overwrote after writing the journal fails
+ * closed there, not here. This fixture's remote is permissive and cannot show
+ * that; the authenticated fixture proves the discrimination separately in
+ * 'rejects the otherwise identical mature journal that assumes an initial zero
+ * observation'. What this test proves is only that the durable gate is open.
  */
 it('recovers an intervened retirement whatever connection sample its last observation left', function (int $connections): void {
     ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
