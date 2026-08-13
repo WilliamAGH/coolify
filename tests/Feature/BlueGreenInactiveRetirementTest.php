@@ -6138,7 +6138,13 @@ it('rejects unknown or invalid historical retirement measurements before remote 
     'invalid negative measurement' => -1,
 ]);
 
-it('rejects another positive historical retirement measurement before journal inspection', function (): void {
+/**
+ * A positive sample other than one is an ordinary intervened shape: seven of
+ * the eight escalation call sites never touch the sample at all. Recovery no
+ * longer short-circuits on it -- it reaches the journal and refuses there, on
+ * the journal's own evidence, if the journal does not authenticate.
+ */
+it('inspects the journal for a positive historical retirement measurement rather than refusing on the sample', function (): void {
     ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
     $state->update([
         'inactive_retirement_last_observed_connections' => 2,
@@ -6165,7 +6171,7 @@ it('rejects another positive historical retirement measurement before journal in
 
     expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
         ->and($remotePayloads)->toContain("tr -d '\\n' < /proc/sys/kernel/random/boot_id")
-        ->and($remotePayloads)->not->toContain(WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX);
+        ->and($remotePayloads)->toContain(WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX);
 });
 
 it('rejects a running mature target whose live connection count is not exactly zero', function (int|string $connections): void {
@@ -6257,6 +6263,62 @@ it('recovers an intervened retirement whose attempts never reached the retry bud
     'escalated midway through the budget' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1,
     'escalated past the budget' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS + 1,
 ]);
+
+/**
+ * Seven of the eight escalation call sites never touch the connection sample,
+ * so an intervened owner carries whatever its last observation left. Recovery
+ * reads the sample only to reconstruct the journal's own drain script, which
+ * branches on zero and nothing else, so every recorded value is recoverable.
+ */
+it('recovers an intervened retirement whatever connection sample its last observation left', function (int $connections): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update([
+        'inactive_retirement_attempts' => 1,
+        'inactive_retirement_last_observed_connections' => $connections,
+    ]);
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'absent');
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Recover an intervened retirement regardless of its recorded connection sample.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and($state->fresh()->inactive_retirement_stopped_at)->not->toBeNull();
+})->with([
+    'drained to zero before escalating' => 0,
+    'escalated with several connections open' => 3,
+]);
+
+it('requeues one current-generator retirement when an early-escalated owner still has a running target', function (): void {
+    ['state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update(['inactive_retirement_attempts' => 1]);
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'running');
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Requeue an early-escalated retirement whose target is still running.',
+        staleContainerJournal: true,
+    );
+    $requeued = $state->fresh();
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and($requeued->inactive_retirement_stopped_at)->toBeNull()
+        ->and($requeued->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($requeued->inactive_retirement_attempts)->toBe(0);
+    Queue::assertPushed(RetireBlueGreenInactiveContainerJob::class);
+});
 
 it('recovers an exact mature scalar retirement across a server reboot through ordinary journal recovery', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();

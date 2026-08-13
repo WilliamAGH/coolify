@@ -152,10 +152,12 @@ final class RecoverBlueGreenIntervention
             auditLog('blue_green.intervention.recovery_failed', $context, 'error');
             report($exception);
         };
-        if ($this->defersRecoveryFailure) {
-            // Keep only the first refusal: it is the one the operator is shown
-            // if nothing later claims the destination.
-            $this->deferredRecoveryFailure ??= $emit;
+        // Only the first refusal of the first pass is ever held, and only while
+        // a later profile may still claim the destination. Anything else emits
+        // now: a held slot must never swallow a second failure, least of all one
+        // reporting an archive whose outcome could not be proven.
+        if ($this->defersRecoveryFailure && $this->deferredRecoveryFailure === null) {
+            $this->deferredRecoveryFailure = $emit;
 
             return $correlationId;
         }
@@ -211,6 +213,11 @@ final class RecoverBlueGreenIntervention
         ?string $successorHorizonJobId = null,
     ): BlueGreenInterventionRecoveryResult {
         $this->requiredOperationUuid = $requiredOperationUuid;
+        // Every invocation reports under its own correlation and holds no
+        // refusal from a previous one, however this action was resolved.
+        $this->correlationId = null;
+        $this->deferredRecoveryFailure = null;
+        $this->defersRecoveryFailure = false;
         if (($stateId === null) === ($deactivationId === null)) {
             throw new InvalidArgumentException('Blue-green intervention recovery requires exactly one state ID or deactivation ID.');
         }
@@ -324,14 +331,24 @@ final class RecoverBlueGreenIntervention
         // still belong to the completed mutation profile, so its error-channel
         // report waits until that is decided.
         $this->defersRecoveryFailure = $this->mayDeferToCompletedContainerMutationJournal($stateId);
-        $result = $this->recoverJournaledStaleContainerMutation(
-            $stateId,
-            $apply,
-            $reason,
-            $successorQueueId,
-            $successorDeploymentUuid,
-            $successorHorizonJobId,
-        );
+        try {
+            $result = $this->recoverJournaledStaleContainerMutation(
+                $stateId,
+                $apply,
+                $reason,
+                $successorQueueId,
+                $successorDeploymentUuid,
+                $successorHorizonJobId,
+            );
+        } catch (\Throwable $exception) {
+            $this->flushDeferredRecoveryFailure();
+
+            throw $exception;
+        }
+        // Deferral covers the first pass only. Every report below — above all
+        // an archive whose outcome could not be proven — reaches the error
+        // channel the moment it is made.
+        $this->defersRecoveryFailure = false;
         // The pristine, failed first-adoption and mature inactive-retirement
         // profiles each own an exact durable shape and archive under their own
         // proofs, so only a refusal leaves a journal for the completed mutation
@@ -349,8 +366,16 @@ final class RecoverBlueGreenIntervention
             $reason,
             $successorQueueId,
         );
-        if ($completedMutation === null
-            || $completedMutation->outcome === BlueGreenInterventionRecoveryResult::MANUAL_ONLY) {
+        // Only an outcome that actually resolves the destination supersedes the
+        // held refusal. A deferred outcome resolves nothing — it is the shape
+        // that leaves an archive unproven — so the refusal still stands and the
+        // operator is owed both records.
+        $resolved = $completedMutation !== null && in_array($completedMutation->outcome, [
+            BlueGreenInterventionRecoveryResult::RECOVERED,
+            BlueGreenInterventionRecoveryResult::INSPECTED,
+            BlueGreenInterventionRecoveryResult::SKIPPED,
+        ], true);
+        if (! $resolved) {
             $this->flushDeferredRecoveryFailure();
 
             return $completedMutation ?? $result;
@@ -997,20 +1022,24 @@ final class RecoverBlueGreenIntervention
             ];
         }
         if ($state->inactive_retirement_intervention_required_at !== null) {
-            // The attempt count proves nothing about whether the automatic lane
-            // stopped. RetireBlueGreenInactiveContainer::markIntervention()
-            // escalates on any unrecoverable condition — a changed boot or
-            // container identity, a route that no longer proves the target
-            // inactive, a failed drain — without waiting for the retry budget,
-            // so an intervened owner legitimately carries any count. The flag
-            // itself is the durable proof: ResumeBlueGreenInactiveRetirements
-            // excludes every row that has it, and an expired reservation proves
-            // no dispatch is still in flight. Requiring MAX_ATTEMPTS here made
-            // every early escalation permanently unrecoverable.
+            // Neither the attempt count nor an exact connection sample proves
+            // the automatic lane stopped, and requiring either made most
+            // intervened owners permanently unrecoverable.
+            // RetireBlueGreenInactiveContainer::markIntervention() escalates on
+            // any unrecoverable condition — a changed boot or container
+            // identity, a route that no longer proves the target inactive, a
+            // failed drain — without waiting for the retry budget and without
+            // touching the connection sample, so an intervened owner
+            // legitimately carries any count and whatever sample its last
+            // observation left. The flag itself is the durable proof:
+            // ResumeBlueGreenInactiveRetirements excludes every row that has
+            // it, and an expired reservation proves no dispatch is in flight.
+            // The sample is still load-bearing for reconstructing the journal's
+            // own drain script, which branches only on zero, and the context
+            // builder already proved it is a non-negative integer.
             if ($state->inactive_retirement_dispatch_reserved_until_at === null
-                || $this->inactiveRetirementDispatchReservationIsFuture($state)
-                || $state->inactive_retirement_last_observed_connections !== 1) {
-                throw new BlueGreenDeploymentTransitionException('A reserved or unmeasured inactive-retirement owner prevents stale-journal recovery.');
+                || $this->inactiveRetirementDispatchReservationIsFuture($state)) {
+                throw new BlueGreenDeploymentTransitionException('A reserved inactive-retirement owner prevents stale-journal recovery.');
             }
 
             return [

@@ -1308,13 +1308,16 @@ function completedContainerMutationExpectedState(BlueGreenRecoveryScenario $scen
     ) ?? throw new RuntimeException('The completed-mutation fixture requires an exact managed route.');
 }
 
-/** @param array<string, array<string, mixed>> $auditEvents */
+/** @param array<string, list<array<string, mixed>>> $auditEvents */
 function captureCompletedContainerMutationAudit(array &$auditEvents): void
 {
     $auditEvents = [];
     $auditChannel = Mockery::mock();
+    // One event name can legitimately be emitted more than once in a single
+    // invocation -- two independent refusals both stand when nothing resolved
+    // the destination -- so every record is kept rather than overwritten.
     $capture = function (string $event, array $context) use (&$auditEvents): void {
-        $auditEvents[$event] = $context;
+        $auditEvents[$event][] = $context;
     };
     $auditChannel->shouldReceive('warning')->andReturnUsing($capture);
     $auditChannel->shouldReceive('error')->andReturnUsing($capture);
@@ -1360,7 +1363,7 @@ it('classifies a completed container-mutation journal as recoverable without cha
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::INSPECTED)
         ->and($auditEvents)->toHaveKey('blue_green.stale_container_journal.completed_mutation_inspected')
-        ->and($auditEvents['blue_green.stale_container_journal.completed_mutation_inspected']['phase'] ?? null)
+        ->and($auditEvents['blue_green.stale_container_journal.completed_mutation_inspected'][0]['phase'] ?? null)
         ->toBe('completed_container_mutation')
         ->and($journalPresent)->toBeTrue()
         ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
@@ -1609,6 +1612,8 @@ it('never claims an untouched journal once the archive CAS reached the host', fu
             status: 'running',
             health: 'healthy',
         ));
+    $auditEvents = [];
+    captureCompletedContainerMutationAudit($auditEvents);
 
     $result = RecoverBlueGreenIntervention::run(
         stateId: $scenario->state->id,
@@ -1623,7 +1628,17 @@ it('never claims an untouched journal once the archive CAS reached the host', fu
         ->and($result->reasonCode)->toBe('archive_failed')
         ->and($result->correlationId)->not->toBeNull()
         ->and($result->message)->toContain('may have completed')
-        ->and($result->message)->not->toContain('no journal was changed');
+        ->and($result->message)->not->toContain('no journal was changed')
+        // The highest-severity outcome this command can produce. It must reach
+        // the error channel under its own correlation id, and must never be
+        // recorded as a refusal some later profile superseded.
+        ->and(array_column($auditEvents['blue_green.intervention.recovery_failed'] ?? [], 'reason_code'))
+        ->toContain('archive_failed')
+        ->and(array_column($auditEvents['blue_green.intervention.recovery_failed'] ?? [], 'correlation_id'))
+        ->toContain($result->correlationId)
+        ->and($auditEvents)->not->toHaveKey('blue_green.intervention.recovery_superseded')
+        ->and(array_column($auditEvents['blue_green.stale_container_journal.archive_outcome_unknown'] ?? [], 'phase'))
+        ->toContain('completed_mutation_archive_outcome_unknown');
 });
 
 it('reports its own probe failure instead of handing back an earlier profile refusal', function (): void {
@@ -1637,6 +1652,8 @@ it('reports its own probe failure instead of handing back an earlier profile ref
         return Process::result(errorOutput: 'the destination could not be reached', exitCode: 255);
     });
     $stateBefore = $scenario->state->fresh()->getAttributes();
+    $auditEvents = [];
+    captureCompletedContainerMutationAudit($auditEvents);
 
     $result = RecoverBlueGreenIntervention::run(
         stateId: $scenario->state->id,
@@ -1647,6 +1664,14 @@ it('reports its own probe failure instead of handing back an earlier profile ref
         ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
         ->and($result->reasonCode)->toBe('inspection_failed')
         ->and($result->correlationId)->not->toBeNull()
+        // The record behind that correlation id must be this profile's own
+        // probe failure, not an earlier profile's durable refusal wearing it.
+        ->and(array_column($auditEvents['blue_green.intervention.recovery_failed'] ?? [], 'reason_code'))
+        ->toContain('inspection_failed')
+        ->and(array_column($auditEvents['blue_green.intervention.recovery_failed'] ?? [], 'correlation_id'))
+        ->toContain($result->correlationId)
+        ->and(array_column($auditEvents['blue_green.stale_container_journal.manual_only'] ?? [], 'phase'))
+        ->toContain('completed_mutation_probe_failed')
         ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
 });
 
