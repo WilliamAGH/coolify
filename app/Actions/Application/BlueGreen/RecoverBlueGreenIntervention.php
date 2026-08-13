@@ -1745,7 +1745,7 @@ final class RecoverBlueGreenIntervention
      *         completion_sha256: string,
      *         expected_state: BlueGreenProxyState,
      *         inactive_deployment: ApplicationDeploymentQueue,
-     *         mutation_sha256: string,
+     *         mutation_sha256: list<string>,
      *         owner_deployment: ApplicationDeploymentQueue,
      *         replacement_state: BlueGreenProxyState,
      *         target: BlueGreenContainerExpectation

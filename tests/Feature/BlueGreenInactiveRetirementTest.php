@@ -5553,10 +5553,10 @@ SH;
     // Both generators' scripts always exist as candidates, whichever one this
     // journal happens to carry -- that is exactly what the writer reconstructs.
     $commands = $preFixGenerator ? $affectedCommands : $currentCommands;
-    // The journal itself carries the pre-fix generator's script -- that
-    // generator is what strands these journals. Recovery reconstructs both
-    // generators' scripts and lets the journal's checksum select, so the
-    // provenance covers the whole candidate set exactly as the writer does.
+    // The journal carries whichever generator's script $preFixGenerator
+    // selects. Recovery reconstructs both and lets the journal's own checksum
+    // choose, so the provenance always covers the whole candidate set exactly
+    // as the writer builds it -- independent of which script was written.
     $mutationScript = implode("\n", ['set -eu', ...$commands])."\n";
     $completionScript = implode("\n", [
         'set -eu',

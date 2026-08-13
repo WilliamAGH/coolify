@@ -2685,7 +2685,7 @@ class WriteBlueGreenProxyConfiguration
         // checksum is what selects among them, so widening the set never
         // widens what can be replayed.
         $expectedMutationSha256 = array_values(array_unique($expectedMutationSha256));
-        sort($expectedMutationSha256);
+        sort($expectedMutationSha256, SORT_STRING);
         if ($expectedMutationSha256 === []) {
             throw new InvalidArgumentException('The stale inactive-retirement mutation has no reconstructed preimage.');
         }

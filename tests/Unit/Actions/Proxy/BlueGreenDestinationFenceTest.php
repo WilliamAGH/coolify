@@ -1959,6 +1959,36 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         ->and($command)->not->toContain('sh "$container_journal_mutation_decoded"')
         ->and($command)->not->toContain('sh "$container_journal_completion_decoded"');
 
+    // One destination's drain has two legitimate preimages, so the assertion is
+    // an alternation. Nothing else pins the separator: rendering it with
+    // anything but '|' emits a syntactically invalid case statement that no
+    // other test would catch, and the proxy host would reject every recovery
+    // this profile exists to perform.
+    $twoCandidateCommand = $writer->inspectStaleInactiveRetirementContainerMutationJournalCommandFor(
+        proxyPath: '/data/coolify/proxy',
+        stateId: 75,
+        expectedCurrentBootId: destinationFenceBootId(),
+        expectedJournalBootId: destinationFenceBootId(),
+        allowPendingSameBootJournal: true,
+        expectedState: $expectedState,
+        replacementState: $replacementState,
+        expectedMutationSha256: [str_repeat('c', 64), str_repeat('d', 64)],
+        expectedCompletionSha256: str_repeat('e', 64),
+        backendPorts: [8080],
+        targetContainerName: 'app-fenced-blue',
+        targetContainerId: str_repeat('a', 64),
+        applicationId: 17,
+        inactiveDeploymentUuid: 'retirement-inactive',
+        inactiveColor: BlueGreenDeploymentColor::BLUE,
+        inactiveRoutingRevision: 1,
+    );
+
+    expect($twoCandidateCommand)->toContain(
+        'case "$container_journal_mutation_checksum" in '
+            .escapeshellarg(str_repeat('c', 64)).'|'.escapeshellarg(str_repeat('d', 64))
+            .') ;; *) exit 1 ;; esac',
+    );
+
     $quarantineCommand = $writer->quarantineStaleInactiveRetirementContainerMutationJournalCommandFor(
         proxyPath: '/data/coolify/proxy',
         stateId: 75,
