@@ -9,8 +9,8 @@ use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteOutcome;
 use App\Actions\Application\BlueGreen\BlueGreenDeactivationRemoteResult;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentClaim;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentLock;
-use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
 use App\Actions\Application\BlueGreen\BlueGreenOperationFence;
+use App\Actions\Application\BlueGreen\BlueGreenPendingContainerMutationJournalException;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\ClaimBlueGreenDeployment;
 use App\Actions\Application\BlueGreen\DrainBlueGreenPreviousContainer;
@@ -556,7 +556,7 @@ it('runs lifecycle attestation and replica inspection availability paths through
     expect($fixture['operationFence']->releaseIfOwned())->toBeTrue();
 });
 
-it('translates a nonzero pending container mutation journal transport failure into an explicit transition failure', function (): void {
+it('translates a nonzero pending container mutation journal transport failure into an explicit typed fence failure', function (): void {
     config(['constants.ssh.mux_enabled' => false]);
     Storage::fake('ssh-keys');
     $server = blueGreenApplicationRemoteServer('ubuntu');
@@ -582,7 +582,10 @@ it('translates a nonzero pending container mutation journal transport failure in
         state: null,
         expectedState: $configuration->state,
     ))->toThrow(
-        BlueGreenDeploymentTransitionException::class,
+        // Typed, not an untyped transition failure: a caller deciding whether a
+        // journal fences this destination must still be able to tell once
+        // attestation has no clean IDLE recovery owner to hand it to.
+        BlueGreenPendingContainerMutationJournalException::class,
         'pending container mutation journal',
     );
     expect($attempts)->toBe(1);
