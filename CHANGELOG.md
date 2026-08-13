@@ -7,9 +7,11 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(blue-green)* Recover a completed container-mutation stale journal
+- *(blue-green)* Keep the completed-mutation profile on one primary Traefik destination
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 
 ## [4.13.84-fork] - 2026-08-12
