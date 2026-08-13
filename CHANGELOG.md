@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Recover a completed container-mutation stale journal
+
+### 📚 Documentation
+
+- Update changelog
+
 ## [4.13.84-fork] - 2026-08-12
 
 ### 🐛 Bug Fixes
