@@ -541,7 +541,7 @@ final class RecoverBlueGreenIntervention
         } catch (\Throwable) {
             return null;
         }
-        if (! $this->isCompletedContainerMutationJournalCandidate($scope['state'])) {
+        if (! $this->isCompletedContainerMutationJournalCandidate($scope)) {
             return null;
         }
         $context = [
@@ -651,11 +651,21 @@ final class RecoverBlueGreenIntervention
      * the clean IDLE owner to bind to. Durable candidacy itself stays that
      * owner's, so a row it would refuse — an intervened or still-draining
      * inactive retirement above all — is rejected here without one remote call.
+     *
+     * The destination scope is this command's own, unchanged: every profile it
+     * offers acts only on one exact primary Traefik destination, and reaching
+     * this profile through an earlier refusal must not widen that.
+     *
+     * @param  array{application: Application, destination: StandaloneDocker, server: Server, state: ApplicationBlueGreenDeployment}  $scope
      */
-    private function isCompletedContainerMutationJournalCandidate(
-        ApplicationBlueGreenDeployment $state,
-    ): bool {
-        return $state->active_color !== null
+    private function isCompletedContainerMutationJournalCandidate(array $scope): bool
+    {
+        $state = $scope['state'];
+
+        return $scope['application']->blueGreenPrimaryStandaloneDockerDestinationId() === (int) $scope['destination']->id
+            && (int) $scope['destination']->server_id === (int) $scope['server']->id
+            && $scope['server']->proxyType() === ProxyTypes::TRAEFIK->value
+            && $state->active_color !== null
             && $state->managed_file_sha256 !== null
             && ResolveBlueGreenExpectedProxyState::hasDurableDestinationState($state)
             && RecoverCleanIdleBlueGreenContainerMutationJournal::isCleanIdleJournalCandidate($state);

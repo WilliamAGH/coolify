@@ -1213,10 +1213,13 @@ function completedContainerMutationJournalScenario(): BlueGreenRecoveryScenario
 }
 
 /**
- * The reported production shape: the same destination still naming the
- * inactive-retirement owner that finished before the fencing mutation. The
- * mature inactive-retirement profile is reached first and refuses, because the
+ * The reported production shape on its decisive axis: a routed IDLE row that
+ * still names an inactive-retirement owner, terminal, so the mature profile is
+ * reached first and refuses it. Here it refuses in its durable context builder
+ * because the rest of the retirement provenance is already cleared; on the
+ * production row it refuses later, at the remote inspection, because the
  * journal on disk is the deployment's route mutation and not its own drain.
+ * Either way the completed-mutation profile is the only remaining owner.
  */
 function completedContainerMutationJournalScenarioWithTerminalRetirement(): BlueGreenRecoveryScenario
 {
