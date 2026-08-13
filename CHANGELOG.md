@@ -8,9 +8,13 @@ All notable changes to this project will be documented in this file.
 
 - *(blue-green)* Recover a completed container-mutation stale journal
 - *(blue-green)* Keep the completed-mutation profile on one primary Traefik destination
+- *(blue-green)* Recover an inactive retirement intervened before its retry budget
+- *(blue-green)* Decide the container-journal fence on one owned predicate
+- *(blue-green)* Stop paging on a refusal a later profile resolved
 
 ### 📚 Documentation
 
+- Update changelog
 - Update changelog
 - Update changelog
 
