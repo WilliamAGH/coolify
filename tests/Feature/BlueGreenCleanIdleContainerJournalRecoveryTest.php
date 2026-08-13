@@ -1213,13 +1213,11 @@ function completedContainerMutationJournalScenario(): BlueGreenRecoveryScenario
 }
 
 /**
- * The reported production shape on its decisive axis: a routed IDLE row that
- * still names an inactive-retirement owner, terminal, so the mature profile is
- * reached first and refuses it. Here it refuses in its durable context builder
- * because the rest of the retirement provenance is already cleared; on the
- * production row it refuses later, at the remote inspection, because the
- * journal on disk is the deployment's route mutation and not its own drain.
- * Either way the completed-mutation profile is the only remaining owner.
+ * A routed IDLE row that still names an inactive-retirement owner. The mature
+ * profile owns every such row, so this profile declines it whatever the mature
+ * profile decided -- including a refusal, because a refusal there can mean a
+ * leaked unrouted container that no profile can retire, and clearing its
+ * journal fence would only hide that.
  */
 function completedContainerMutationJournalScenarioWithTerminalRetirement(): BlueGreenRecoveryScenario
 {
@@ -1415,7 +1413,7 @@ it('archives a completed container-mutation journal so the destination route is 
         );
 });
 
-it('recovers the reported completed-mutation shape that still names a terminal inactive retirement', function (bool $apply): void {
+it('declines a row that still names an inactive retirement, leaving it to the mature profile', function (bool $apply): void {
     $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
     $expectedState = completedContainerMutationExpectedState($scenario);
     $journalPresent = true;
@@ -1429,29 +1427,23 @@ it('recovers the reported completed-mutation shape that still names a terminal i
         $payloads,
         $journalPresent,
     );
-    InspectBlueGreenContainer::shouldRun()
-        ->once()
-        ->andReturn(new BlueGreenContainerInspection(
-            exists: true,
-            dockerId: $expectedState->activeContainerId,
-            status: 'running',
-            health: 'healthy',
-        ));
+    // Never reached: the row is declined before any runtime is inspected.
+    InspectBlueGreenContainer::shouldRun()->never();
     $stateBefore = $scenario->state->fresh()->getAttributes();
 
     $result = RecoverBlueGreenIntervention::run(
         stateId: $scenario->state->id,
         apply: $apply,
-        reason: $apply ? 'Archive the completed container-mutation journal on the reported production shape.' : null,
+        reason: $apply ? 'Prove a retirement-owning row is declined rather than claimed.' : null,
         staleContainerJournal: true,
     );
 
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
-        ->and($result->outcome)->toBe($apply
-            ? BlueGreenInterventionRecoveryResult::RECOVERED
-            : BlueGreenInterventionRecoveryResult::INSPECTED)
-        ->and($journalPresent)->toBe(! $apply)
-        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($journalPresent)->toBeTrue()
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        // Declined on durable shape alone: the destination is never probed.
+        ->and($payloads)->toBeEmpty();
 })->with([
     'inspection' => false,
     'archival' => true,
@@ -1676,7 +1668,9 @@ it('reports its own probe failure instead of handing back an earlier profile ref
 });
 
 it('does not page an operator with an earlier profile refusal that the completed-mutation profile then resolved', function (): void {
-    $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
+    // A routed IDLE row with its retirement provenance cleared: the profiles
+    // above refuse it on durable shape, and this one owns and recovers it.
+    $scenario = completedContainerMutationJournalScenario();
     $expectedState = completedContainerMutationExpectedState($scenario);
     $journalPresent = true;
     $payloads = [];

@@ -6261,6 +6261,47 @@ it('rejects an immature or unexpired intervention before journal inspection', fu
  * stranded on precisely this: recovery reconstructed only the affected form, so
  * the current-form journal its own deployment had written could never match.
  */
+/**
+ * The gap the completed-mutation profile's ordering left untested: a fully
+ * populated terminal retirement -- stopped_at recorded, intervention and
+ * reservation cleared -- reaching the mature profile's remote inspection rather
+ * than stopping in its durable context builder. Two shapes, both owned here.
+ *
+ * An absent target is the ordinary spent drain and reconciles. A target that is
+ * running again is a leaked unrouted container: the mature profile refuses it,
+ * no profile can retire it, and the completed-mutation profile must not claim
+ * the row and clear the journal fence that surfaces it.
+ */
+it('owns a fully populated terminal retirement whose target is running again', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update([
+        'inactive_retirement_stopped_at' => now()->subMinute(),
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => null,
+    ]);
+    $journal = authenticatedMatureInactiveRetirementJournal($application, $owner, $state->fresh());
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote($payloads, $archived, 'running', $journal);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Prove a leaked unrouted container keeps its journal fence.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($archived)->toBeFalse()
+        // The refusal stands. The completed-mutation profile never inspects a
+        // row that still names an inactive retirement, so it cannot clear the
+        // journal fence that surfaces the leak.
+        ->and($payloads)->not->toBeEmpty()
+        ->and(implode("\n", $payloads))
+        ->not->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX);
+});
+
 it('authenticates a mature journal written by either drain generator', function (bool $preFixGenerator): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
     $journal = authenticatedMatureInactiveRetirementJournal(
