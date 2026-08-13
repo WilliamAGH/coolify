@@ -928,11 +928,20 @@ final class RecoverBlueGreenIntervention
             ];
         }
         if ($state->inactive_retirement_intervention_required_at !== null) {
-            if ($state->inactive_retirement_attempts !== RetireBlueGreenInactiveContainer::MAX_ATTEMPTS
-                || $state->inactive_retirement_dispatch_reserved_until_at === null
+            // The attempt count proves nothing about whether the automatic lane
+            // stopped. RetireBlueGreenInactiveContainer::markIntervention()
+            // escalates on any unrecoverable condition — a changed boot or
+            // container identity, a route that no longer proves the target
+            // inactive, a failed drain — without waiting for the retry budget,
+            // so an intervened owner legitimately carries any count. The flag
+            // itself is the durable proof: ResumeBlueGreenInactiveRetirements
+            // excludes every row that has it, and an expired reservation proves
+            // no dispatch is still in flight. Requiring MAX_ATTEMPTS here made
+            // every early escalation permanently unrecoverable.
+            if ($state->inactive_retirement_dispatch_reserved_until_at === null
                 || $this->inactiveRetirementDispatchReservationIsFuture($state)
                 || $state->inactive_retirement_last_observed_connections !== 1) {
-                throw new BlueGreenDeploymentTransitionException('An immature or reserved inactive-retirement owner prevents stale-journal recovery.');
+                throw new BlueGreenDeploymentTransitionException('A reserved or unmeasured inactive-retirement owner prevents stale-journal recovery.');
             }
 
             return [

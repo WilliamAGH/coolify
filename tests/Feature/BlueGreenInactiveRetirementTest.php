@@ -6214,18 +6214,48 @@ it('rejects an immature or unexpired intervention before journal inspection', fu
         ->and($archived)->toBeFalse();
     Queue::assertNothingPushed();
 })->with([
-    'attempt threshold not reached' => [[
-        'inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1,
-    ]],
-    'attempt threshold exceeded' => [[
-        'inactive_retirement_attempts' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS + 1,
-    ]],
     'dispatch reservation missing' => [[
         'inactive_retirement_dispatch_reserved_until_at' => null,
     ]],
     'dispatch reservation still live' => [[
         'inactive_retirement_dispatch_reserved_until_at' => now()->addDay(),
     ]],
+]);
+
+/**
+ * markIntervention() escalates on any unrecoverable condition — a changed boot
+ * identity, a changed container identity, a route that no longer proves the
+ * target inactive, a failed drain — without waiting for the retry budget. So an
+ * intervened owner can carry any attempt count, and the flag itself is what
+ * proves the automatic lane stopped: ResumeBlueGreenInactiveRetirements skips
+ * every row that has it. Recovery gates on the flag and an expired dispatch
+ * reservation, never on the attempt count.
+ */
+it('recovers an intervened retirement whose attempts never reached the retry budget', function (int $attempts): void {
+    ['owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $state->update(['inactive_retirement_attempts' => $attempts]);
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeMatureInactiveRetirementJournalRemote($payloads, $archived, 'absent');
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Recover an intervened retirement that escalated before exhausting its retry budget.',
+        staleContainerJournal: true,
+    );
+    $recovered = $state->fresh();
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue()
+        ->and($recovered->inactive_retirement_stopped_at)->not->toBeNull()
+        ->and($recovered->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($recovered->inactive_retirement_dispatch_reserved_until_at)->toBeNull();
+})->with([
+    'escalated on the first attempt' => 1,
+    'escalated midway through the budget' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS - 1,
+    'escalated past the budget' => RetireBlueGreenInactiveContainer::MAX_ATTEMPTS + 1,
 ]);
 
 it('recovers an exact mature scalar retirement across a server reboot through ordinary journal recovery', function (): void {
