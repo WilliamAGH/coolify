@@ -162,7 +162,15 @@ jobs:
     name: Blue-green lifecycle (PostgreSQL)
     needs: source-identity
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # This lane carries the whole blue-green manifest against a real
+    # PostgreSQL, and it grows with the recovery profiles it proves. It spent
+    # 17m43s of a 20m budget on 4.13.86-fork and exceeded it on the next
+    # release, cancelling mid-suite -- a capacity signal reported as a failure,
+    # which is the least useful shape a red lane can take. 30m matches its
+    # sibling lanes and leaves real headroom; the cost of a genuinely hung run
+    # is ten more minutes, against repeatedly re-releasing to discover the
+    # budget was simply too small.
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
