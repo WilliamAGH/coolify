@@ -4,10 +4,12 @@ use App\Actions\Application\BlueGreen\AttestBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\BlueGreenContainerExpectation;
 use App\Actions\Application\BlueGreen\BlueGreenContainerInspection;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
+use App\Actions\Application\BlueGreen\BlueGreenInterventionRecoveryResult;
 use App\Actions\Application\BlueGreen\BlueGreenManagedRouteMetadataForOperationResult;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaInspection;
 use App\Actions\Application\BlueGreen\BlueGreenReplicaSet;
 use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
+use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
 use App\Actions\Application\BlueGreen\RecoverCleanIdleBlueGreenContainerMutationJournal;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyStates;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
@@ -30,6 +32,7 @@ use App\Models\InstanceSettings;
 use App\Models\Server;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\PendingProcess;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
 use Tests\Support\BlueGreenRecoveryScenario;
 
@@ -1185,4 +1188,461 @@ it('proves a released fan-out route carrying the legacy aggregate digest against
             BlueGreenDeploymentTransitionException::class,
             'no longer matches its durable route identity',
         );
+});
+
+/**
+ * One routed, cleanly claimable IDLE destination whose last container mutation
+ * committed everywhere and left only its journal behind — the shape that fences
+ * every managed-route read until an operator archives the journal.
+ */
+function completedContainerMutationJournalScenario(): BlueGreenRecoveryScenario
+{
+    $scenario = BlueGreenRecoveryScenario::create(finalized: true, routingMutationRecorded: true);
+    $scenario->state->update([
+        ...ApplicationBlueGreenDeployment::clearedOperationAttributes(),
+        ...ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes(),
+        'legacy_container_name' => null,
+        'phase' => BlueGreenDeploymentPhase::IDLE,
+    ]);
+    $scenario->deployment->update([
+        'status' => ApplicationDeploymentStatus::FINISHED->value,
+        'finished_at' => now()->subMinute(),
+    ]);
+
+    return $scenario;
+}
+
+/**
+ * The reported production shape: the same destination still naming the
+ * inactive-retirement owner that finished before the fencing mutation. The
+ * mature inactive-retirement profile is reached first and refuses, because the
+ * journal on disk is the deployment's route mutation and not its own drain.
+ */
+function completedContainerMutationJournalScenarioWithTerminalRetirement(): BlueGreenRecoveryScenario
+{
+    $scenario = completedContainerMutationJournalScenario();
+    $scenario->state->update([
+        'inactive_retirement_owner_deployment_uuid' => $scenario->deployment->deployment_uuid,
+        'inactive_retirement_stopped_at' => now()->subMinute(),
+        'inactive_retirement_intervention_required_at' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => null,
+    ]);
+
+    return $scenario;
+}
+
+/**
+ * @param  list<string>  $payloads
+ */
+function fakeCompletedContainerMutationJournalRemote(
+    BlueGreenProxyState $journalExpectedState,
+    BlueGreenProxyState $journalReplacementState,
+    BlueGreenProxyState $liveState,
+    string $journalSha256,
+    string $journalBootId,
+    array &$payloads,
+    bool &$journalPresent,
+): void {
+    $payloads = [];
+    Process::fake(function (PendingProcess $process) use (
+        $journalExpectedState,
+        $journalReplacementState,
+        $liveState,
+        $journalSha256,
+        $journalBootId,
+        &$payloads,
+        &$journalPresent,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        $payloads[] = $payload;
+        if (isCleanIdleBootIdentityRead($payload)) {
+            return Process::result(output: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
+        }
+        if (str_contains($payload, 'committed_container_manifest_stage=')) {
+            $journalPresent = false;
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX,
+                'archived',
+                $journalSha256,
+                (new WriteBlueGreenProxyConfiguration)->committedContainerMutationJournalArchiveFilename(
+                    $journalReplacementState->managedFilename,
+                    $journalSha256,
+                ),
+            ]));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            if (! $journalPresent) {
+                return Process::result(output: WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX.'|absent');
+            }
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
+                $journalSha256,
+                $journalBootId,
+                BlueGreenProxyRollbackArtifact::PRESENT_STATE,
+                $journalReplacementState->managedSha256,
+                hash('sha256', 'completed-mutation-script'),
+                hash('sha256', 'completed-completion-script'),
+            ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($journalReplacementState->serialize()));
+        }
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            return Process::result(output: 'coolify-blue-green-managed-route:present:'
+                .base64_encode($liveState->serialize())."\n".$liveState->managedSha256);
+        }
+
+        return Process::result();
+    });
+}
+
+function completedContainerMutationExpectedState(BlueGreenRecoveryScenario $scenario): BlueGreenProxyState
+{
+    return ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ) ?? throw new RuntimeException('The completed-mutation fixture requires an exact managed route.');
+}
+
+/** @param array<string, array<string, mixed>> $auditEvents */
+function captureCompletedContainerMutationAudit(array &$auditEvents): void
+{
+    $auditEvents = [];
+    $auditChannel = Mockery::mock();
+    $capture = function (string $event, array $context) use (&$auditEvents): void {
+        $auditEvents[$event] = $context;
+    };
+    $auditChannel->shouldReceive('warning')->andReturnUsing($capture);
+    $auditChannel->shouldReceive('error')->andReturnUsing($capture);
+    $auditChannel->shouldReceive('info')->andReturnUsing($capture);
+    Log::shouldReceive('channel')->andReturn($auditChannel);
+    Log::shouldReceive('warning')->andReturnNull();
+    Log::shouldReceive('error')->andReturnNull();
+    Log::shouldReceive('info')->andReturnNull();
+    Log::shouldReceive('debug')->andReturnNull();
+}
+
+it('classifies a completed container-mutation journal as recoverable without changing it', function (): void {
+    $scenario = completedContainerMutationJournalScenario();
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $journalPresent = true;
+    $payloads = [];
+    fakeCompletedContainerMutationJournalRemote(
+        cleanIdleJournalStateWithOperation($expectedState, 'completed-mutation-predecessor'),
+        $expectedState,
+        $expectedState,
+        hash('sha256', 'completed-mutation-journal'),
+        (string) $scenario->deployment->blue_green_server_boot_id,
+        $payloads,
+        $journalPresent,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectedState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+    $auditEvents = [];
+    captureCompletedContainerMutationAudit($auditEvents);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::INSPECTED)
+        ->and($auditEvents)->toHaveKey('blue_green.stale_container_journal.completed_mutation_inspected')
+        ->and($auditEvents['blue_green.stale_container_journal.completed_mutation_inspected']['phase'] ?? null)
+        ->toBe('completed_container_mutation')
+        ->and($journalPresent)->toBeTrue()
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and(implode("\n", $payloads))->not->toContain(
+            'committed_container_manifest_stage=',
+            'sh "$operation_container_mutation_decoded"',
+            'sh "$operation_container_completion_decoded"',
+        );
+});
+
+it('archives a completed container-mutation journal so the destination route is observable again', function (): void {
+    $scenario = completedContainerMutationJournalScenario();
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $journalPresent = true;
+    $payloads = [];
+    fakeCompletedContainerMutationJournalRemote(
+        cleanIdleJournalStateWithOperation($expectedState, 'completed-mutation-predecessor'),
+        $expectedState,
+        $expectedState,
+        hash('sha256', 'completed-mutation-journal'),
+        (string) $scenario->deployment->blue_green_server_boot_id,
+        $payloads,
+        $journalPresent,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectedState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Archive the completed container-mutation journal that fences every managed-route read.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($journalPresent)->toBeFalse()
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and(implode("\n", $payloads))->not->toContain(
+            'sh "$operation_container_mutation_decoded"',
+            'sh "$operation_container_completion_decoded"',
+        );
+});
+
+it('recovers the reported completed-mutation shape that still names a terminal inactive retirement', function (bool $apply): void {
+    $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $journalPresent = true;
+    $payloads = [];
+    fakeCompletedContainerMutationJournalRemote(
+        cleanIdleJournalStateWithOperation($expectedState, 'completed-mutation-predecessor'),
+        $expectedState,
+        $expectedState,
+        hash('sha256', 'completed-mutation-journal'),
+        (string) $scenario->deployment->blue_green_server_boot_id,
+        $payloads,
+        $journalPresent,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectedState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: $apply,
+        reason: $apply ? 'Archive the completed container-mutation journal on the reported production shape.' : null,
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe($apply
+            ? BlueGreenInterventionRecoveryResult::RECOVERED
+            : BlueGreenInterventionRecoveryResult::INSPECTED)
+        ->and($journalPresent)->toBe(! $apply)
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
+})->with([
+    'inspection' => false,
+    'archival' => true,
+]);
+
+it('leaves a live inactive retirement to the mature profile instead of the completed-mutation profile', function (): void {
+    $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
+    $scenario->state->update([
+        'inactive_retirement_stopped_at' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => now()->addMinutes(5),
+    ]);
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $journalPresent = true;
+    $payloads = [];
+    fakeCompletedContainerMutationJournalRemote(
+        cleanIdleJournalStateWithOperation($expectedState, 'completed-mutation-predecessor'),
+        $expectedState,
+        $expectedState,
+        hash('sha256', 'completed-mutation-journal'),
+        (string) $scenario->deployment->blue_green_server_boot_id,
+        $payloads,
+        $journalPresent,
+    );
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($journalPresent)->toBeTrue()
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        // A durable refusal still costs the destination nothing: the completed
+        // mutation profile never probes a row the mature profile owns.
+        ->and($payloads)->toBeEmpty();
+});
+
+it('refuses a completed container-mutation journal whose payload does not equal the durable destination state', function (
+    bool $apply,
+    string $expectedOutcome,
+    string $expectedReasonCode,
+): void {
+    $scenario = completedContainerMutationJournalScenario();
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $impostorState = new BlueGreenProxyState(
+        managedFilename: $expectedState->managedFilename,
+        applicationUuid: $expectedState->applicationUuid,
+        destinationId: $expectedState->destinationId,
+        operationId: $expectedState->operationId,
+        mutationSequence: $expectedState->mutationSequence,
+        destinationFenceEpoch: $expectedState->destinationFenceEpoch,
+        routingRevision: $expectedState->routingRevision,
+        managedSha256: $expectedState->managedSha256,
+        activeColor: $expectedState->activeColor,
+        activeDeploymentUuid: $expectedState->activeDeploymentUuid,
+        activeContainerName: $expectedState->activeContainerName,
+        activeContainerId: str_repeat('c', 64),
+        applicationRoutingConfigDigest: $expectedState->applicationRoutingConfigDigest,
+        destinationTopologyDigest: $expectedState->destinationTopologyDigest,
+    );
+    $journalPresent = true;
+    $payloads = [];
+    fakeCompletedContainerMutationJournalRemote(
+        cleanIdleJournalStateWithOperation($impostorState, 'completed-mutation-predecessor'),
+        $impostorState,
+        $expectedState,
+        hash('sha256', 'completed-mutation-journal'),
+        (string) $scenario->deployment->blue_green_server_boot_id,
+        $payloads,
+        $journalPresent,
+    );
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: $apply,
+        reason: $apply ? 'Prove the completed-mutation profile refuses a journal that does not equal the durable state.' : null,
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe($expectedOutcome)
+        ->and($result->reasonCode)->toBe($expectedReasonCode)
+        ->and($journalPresent)->toBeTrue()
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
+        ->and(implode("\n", $payloads))->not->toContain('committed_container_manifest_stage=');
+})->with([
+    'inspection refuses and proves nothing changed' => [
+        false,
+        BlueGreenInterventionRecoveryResult::MANUAL_ONLY,
+        'inspection_failed',
+    ],
+    'archival refuses before dispatching any CAS' => [
+        true,
+        BlueGreenInterventionRecoveryResult::MANUAL_ONLY,
+        'inspection_failed',
+    ],
+]);
+
+it('never claims an untouched journal once the archive CAS reached the host', function (): void {
+    $scenario = completedContainerMutationJournalScenario();
+    $expectedState = completedContainerMutationExpectedState($scenario);
+    $journalSha256 = hash('sha256', 'completed-mutation-journal');
+    $journalExpectedState = cleanIdleJournalStateWithOperation($expectedState, 'completed-mutation-predecessor');
+    $journalBootId = (string) $scenario->deployment->blue_green_server_boot_id;
+    $journalPresent = true;
+
+    Process::fake(function (PendingProcess $process) use (
+        $expectedState,
+        $journalExpectedState,
+        $journalBootId,
+        $journalSha256,
+        &$journalPresent,
+    ) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (isCleanIdleBootIdentityRead($payload)) {
+            return Process::result(output: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
+        }
+        if (str_contains($payload, 'committed_container_manifest_stage=')) {
+            $journalPresent = false;
+
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::COMMITTED_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX,
+                'archived',
+                $journalSha256,
+                (new WriteBlueGreenProxyConfiguration)->committedContainerMutationJournalArchiveFilename(
+                    $expectedState->managedFilename,
+                    $journalSha256,
+                ),
+            ]));
+        }
+        if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX)) {
+            return Process::result(output: implode('|', [
+                WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX,
+                BlueGreenManagedRouteMetadataForOperationResult::COMMITTED_REPLACEMENT_SIDECAR,
+                $journalSha256,
+                $journalBootId,
+                BlueGreenProxyRollbackArtifact::PRESENT_STATE,
+                $expectedState->managedSha256,
+                hash('sha256', 'completed-mutation-script'),
+                hash('sha256', 'completed-completion-script'),
+            ])."\n".base64_encode($journalExpectedState->serialize())."\n".base64_encode($expectedState->serialize()));
+        }
+        // The archive landed; only the proof read afterwards is lost.
+        if (str_contains($payload, 'coolify-blue-green-managed-route:present:')) {
+            return Process::result(errorOutput: 'transport lost after the archive CAS', exitCode: 255);
+        }
+
+        return Process::result();
+    });
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectedState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        apply: true,
+        reason: 'Prove a dispatched archive is never reported as an untouched journal.',
+        staleContainerJournal: true,
+    );
+
+    expect($journalPresent)->toBeFalse()
+        ->and($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::DEFERRED)
+        ->and($result->reasonCode)->toBe('archive_failed')
+        ->and($result->correlationId)->not->toBeNull()
+        ->and($result->message)->toContain('may have completed')
+        ->and($result->message)->not->toContain('no journal was changed');
+});
+
+it('reports its own probe failure instead of handing back an earlier profile refusal', function (): void {
+    $scenario = completedContainerMutationJournalScenario();
+    Process::fake(function (PendingProcess $process) {
+        $payload = (string) $process->command."\n".(string) $process->input;
+        if (isCleanIdleBootIdentityRead($payload)) {
+            return Process::result(output: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff');
+        }
+
+        return Process::result(errorOutput: 'the destination could not be reached', exitCode: 255);
+    });
+    $stateBefore = $scenario->state->fresh()->getAttributes();
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $scenario->state->id,
+        staleContainerJournal: true,
+    );
+
+    expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
+        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
+        ->and($result->reasonCode)->toBe('inspection_failed')
+        ->and($result->correlationId)->not->toBeNull()
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
 });

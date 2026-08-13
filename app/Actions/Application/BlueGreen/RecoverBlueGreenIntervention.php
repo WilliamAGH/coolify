@@ -10,6 +10,7 @@ use App\Enums\BlueGreenDeactivationPhase;
 use App\Enums\BlueGreenDeploymentColor;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ProxyTypes;
+use App\Exceptions\BlueGreenRecoveryHandoffException;
 use App\Jobs\ResumeBlueGreenDrainingDeploymentJob;
 use App\Jobs\RetireBlueGreenInactiveContainerJob;
 use App\Models\Application;
@@ -38,6 +39,8 @@ final class RecoverBlueGreenIntervention
     private const STALE_CONTAINER_JOURNAL_REMOTE_TIMEOUT_SECONDS = 60;
 
     private const STALE_FIRST_ADOPTION_RUNTIME_OUTPUT_PREFIX = 'coolify-blue-green-stale-first-adoption-runtime:v1';
+
+    private const COMPLETED_CONTAINER_MUTATION_PROFILE = 'completed_container_mutation';
 
     public string $commandSignature = 'blue-green:recover-intervention
         {--state= : application_blue_green_deployments ID}
@@ -274,6 +277,39 @@ final class RecoverBlueGreenIntervention
         ?string $successorDeploymentUuid,
         ?string $successorHorizonJobId,
     ): BlueGreenInterventionRecoveryResult {
+        $result = $this->recoverJournaledStaleContainerMutation(
+            $stateId,
+            $apply,
+            $reason,
+            $successorQueueId,
+            $successorDeploymentUuid,
+            $successorHorizonJobId,
+        );
+        // The pristine, failed first-adoption and mature inactive-retirement
+        // profiles each own an exact durable shape and archive under their own
+        // proofs, so only a refusal leaves a journal for the completed mutation
+        // profile to claim. A deferred or archived outcome is already one of
+        // those profiles' answers and is never second-guessed here.
+        if ($result->outcome !== BlueGreenInterventionRecoveryResult::MANUAL_ONLY) {
+            return $result;
+        }
+
+        return $this->recoverCompletedContainerMutationJournal(
+            $stateId,
+            $apply,
+            $reason,
+            $successorQueueId,
+        ) ?? $result;
+    }
+
+    private function recoverJournaledStaleContainerMutation(
+        int $stateId,
+        bool $apply,
+        ?string $reason,
+        ?int $successorQueueId,
+        ?string $successorDeploymentUuid,
+        ?string $successorHorizonJobId,
+    ): BlueGreenInterventionRecoveryResult {
         try {
             $context = $this->staleContainerMutationJournalContext(
                 $stateId,
@@ -465,6 +501,164 @@ final class RecoverBlueGreenIntervention
         } finally {
             $this->releaseStateFence($operationFence);
         }
+    }
+
+    /**
+     * The inverse of the failed first-adoption profile: a container mutation
+     * that committed everywhere — sidecar bytes, managed route, durable row and
+     * queue history — and left only its journal behind. That journal fences
+     * every managed-route read for the destination, so the application keeps
+     * serving while its active container state stays unobservable and every
+     * later deployment is rejected.
+     *
+     * The journal's own committed marker is the only classifier here, and the
+     * clean IDLE journal owner holds every archival proof and the archive
+     * itself. This profile routes; it never restates those proofs. It runs only
+     * on a journal every earlier profile refused, so no destination those
+     * profiles own — a failed first adoption, or an inactive retirement whose
+     * own drain journal they can still authenticate and reconcile — is taken
+     * from them. Null means the refusal stands exactly as they reported it.
+     *
+     * @param  int|null  $successorQueueId  A caller that bound one exact live successor decided
+     *                                      it against the failed first-adoption rollback, so
+     *                                      this profile never silently discards that binding.
+     */
+    private function recoverCompletedContainerMutationJournal(
+        int $stateId,
+        bool $apply,
+        ?string $reason,
+        ?int $successorQueueId,
+    ): ?BlueGreenInterventionRecoveryResult {
+        if ($successorQueueId !== null) {
+            return null;
+        }
+        // A destination that no longer resolves was already diagnosed by the
+        // profiles above from the same durable rows, and a row this profile
+        // does not own needs no probe at all. Neither reaches the host, so
+        // neither displaces their answer.
+        try {
+            $scope = $this->destinationRecoveryContext($stateId);
+        } catch (\Throwable) {
+            return null;
+        }
+        if (! $this->isCompletedContainerMutationJournalCandidate($scope['state'])) {
+            return null;
+        }
+        $context = [
+            ...$scope,
+            'managed_filename' => BlueGreenRoutingTarget::managedFilename(
+                (string) $scope['application']->uuid,
+                (int) $scope['destination']->id,
+            ),
+        ];
+
+        try {
+            $inspection = (new ReadBlueGreenManagedRouteMetadataForOperation)->inspect(
+                $scope['server'],
+                $scope['application'],
+                $scope['destination'],
+                $this->readStaleContainerMutationJournalBootIdentity($scope['server']),
+            );
+        } catch (\Throwable $exception) {
+            // The host could not say whether this profile applies. That is this
+            // profile's own failure, not the earlier refusal the operator would
+            // otherwise be handed, so it answers with a correlated record
+            // pointing at the real transport or boot fault.
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $context,
+                'completed_mutation_probe_failed',
+                $exception,
+                'inspection_failed',
+            );
+        }
+        if (! $inspection->hasCommittedReplacementSidecar()) {
+            return null;
+        }
+
+        $archiveDispatch = new BlueGreenJournalArchiveDispatch;
+        try {
+            RecoverCleanIdleBlueGreenContainerMutationJournal::run(
+                $scope['server'],
+                $scope['application'],
+                $scope['destination'],
+                $scope['state'],
+                $apply,
+                $archiveDispatch,
+            );
+        } catch (BlueGreenRecoveryHandoffException) {
+            return $this->staleContainerMutationJournalDeferred($stateId, $reason, $context, 'live_lifecycle_owner');
+        } catch (\Throwable $exception) {
+            // The owner marks the exact moment it hands a CAS to the host, so
+            // an untouched journal is reported as one and only a genuinely
+            // dispatched archive is reported as an unproven outcome.
+            if ($archiveDispatch->wasDispatched()) {
+                return $this->staleContainerMutationJournalArchiveOutcomeUnknown(
+                    $stateId,
+                    $reason,
+                    $context,
+                    'completed_mutation_archive_outcome_unknown',
+                    $exception,
+                    'archive_failed',
+                );
+            }
+            if ($exception instanceof BlueGreenOperationFenceLostException) {
+                return $this->staleContainerMutationJournalDeferred(
+                    $stateId,
+                    $reason,
+                    $context,
+                    'completed_mutation_fence_lost',
+                );
+            }
+
+            return $this->staleContainerMutationJournalManualOnly(
+                $stateId,
+                $reason,
+                $context,
+                'completed_mutation_inspection_failed',
+                $exception,
+                'inspection_failed',
+            );
+        }
+        $this->auditStaleContainerMutationJournal(
+            $apply
+                ? 'blue_green.stale_container_journal.completed_mutation_recovered'
+                : 'blue_green.stale_container_journal.completed_mutation_inspected',
+            $stateId,
+            $context,
+            $reason,
+            ['phase' => self::COMPLETED_CONTAINER_MUTATION_PROFILE],
+        );
+
+        return new BlueGreenInterventionRecoveryResult(
+            classification: BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL,
+            outcome: $apply
+                ? BlueGreenInterventionRecoveryResult::RECOVERED
+                : BlueGreenInterventionRecoveryResult::INSPECTED,
+            message: $apply
+                ? 'The exact completed container-mutation journal was archived without replaying or deleting it; the destination route is observable again.'
+                : 'The exact completed container-mutation journal proved every archival precondition; no journal was changed.',
+            stateId: $stateId,
+        );
+    }
+
+    /**
+     * A completed mutation always leaves a routed destination fence behind, so
+     * only such a row can carry this journal: an unrouted row belongs to the
+     * pristine or failed first-adoption profile, and a first adoption that
+     * committed on-host without reaching the durable row has no operation for
+     * the clean IDLE owner to bind to. Durable candidacy itself stays that
+     * owner's, so a row it would refuse — an intervened or still-draining
+     * inactive retirement above all — is rejected here without one remote call.
+     */
+    private function isCompletedContainerMutationJournalCandidate(
+        ApplicationBlueGreenDeployment $state,
+    ): bool {
+        return $state->active_color !== null
+            && $state->managed_file_sha256 !== null
+            && ResolveBlueGreenExpectedProxyState::hasDurableDestinationState($state)
+            && RecoverCleanIdleBlueGreenContainerMutationJournal::isCleanIdleJournalCandidate($state);
     }
 
     /**

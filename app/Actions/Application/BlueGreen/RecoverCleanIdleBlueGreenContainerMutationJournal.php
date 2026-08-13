@@ -28,11 +28,42 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
 {
     use AsAction;
 
+    /**
+     * The durable shape this owner can archive a journal for, decided without
+     * touching the destination. cleanIdleSnapshot() re-proves it under the
+     * lifecycle fence and the destination locks; a caller uses it beforehand to
+     * avoid probing a destination this owner would refuse anyway.
+     */
+    public static function isCleanIdleJournalCandidate(ApplicationBlueGreenDeployment $state): bool
+    {
+        return $state->phase === BlueGreenDeploymentPhase::IDLE
+            && ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)
+            && $state->legacy_container_name === null
+            && $state->intervention_phase === null
+            && $state->intervention_reason === null
+            && self::inactiveRetirementIsTerminalOrCleared($state);
+    }
+
+    /**
+     * @param  bool  $apply  False proves every archival precondition of one exact
+     *                       committed journal and stops before the CAS, so an
+     *                       operator can classify a fenced destination without
+     *                       changing it. Any other journal shape is refused in
+     *                       that mode: there is nothing to prove archivable.
+     * @param  BlueGreenJournalArchiveDispatch|null  $archiveDispatch  Marked the moment a CAS
+     *                                                                 is handed to the host, so a
+     *                                                                 caller that survives this
+     *                                                                 throwing can tell an
+     *                                                                 untouched journal from one
+     *                                                                 whose outcome is unknown.
+     */
     public function handle(
         Server $server,
         Application $application,
         StandaloneDocker $destination,
         ApplicationBlueGreenDeployment $candidate,
+        bool $apply = true,
+        ?BlueGreenJournalArchiveDispatch $archiveDispatch = null,
     ): ?BlueGreenProxyState {
         if ((int) $candidate->application_id !== (int) $application->getKey()
             || (int) $candidate->standalone_docker_id !== (int) $destination->getKey()
@@ -60,6 +91,9 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                 $currentBootId,
             );
             $operationFence->assertLockOwnership();
+            if (! $apply && ! $inspection->hasCommittedReplacementSidecar()) {
+                throw new BlueGreenDeploymentTransitionException('The clean IDLE destination carries no committed container-mutation journal to prove archivable.');
+            }
             if ($inspection->isAbsent()) {
                 $expectedState = $this->cleanIdleSnapshot(
                     $application,
@@ -82,6 +116,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                     $inspection,
                     $operationFence,
                     $currentBootId,
+                    $archiveDispatch,
                 );
             }
             if (! $inspection->hasCommittedReplacementSidecar()
@@ -118,7 +153,11 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                 $operationId,
                 $inspection->journalBootId,
             );
+            if (! $apply) {
+                return $expectedState;
+            }
 
+            $archiveDispatch?->markDispatched();
             $archivedState = $reader->archiveCommittedReplacementSidecarWithoutFinalization(
                 $server,
                 $application,
@@ -181,12 +220,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
                 || (int) $state->getKey() !== $expectedStateId
                 || $locks->application->trashed()
                 || ! $locks->setting->is_blue_green_deployment_enabled
-                || $state->phase !== BlueGreenDeploymentPhase::IDLE
-                || ! ClaimBlueGreenDeployment::stateIsCleanlyClaimable($state)
-                || $state->legacy_container_name !== null
-                || $state->intervention_phase !== null
-                || $state->intervention_reason !== null
-                || ! $this->inactiveRetirementIsTerminalOrCleared($state)) {
+                || ! self::isCleanIdleJournalCandidate($state)) {
                 throw new BlueGreenDeploymentTransitionException('The destination is not an unowned, cleanly claimable IDLE blue-green state.');
             }
             if ($locks->deactivation !== null) {
@@ -301,6 +335,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         BlueGreenManagedRouteMetadataForOperationResult $inspection,
         BlueGreenOperationFence $operationFence,
         string $currentBootId,
+        ?BlueGreenJournalArchiveDispatch $archiveDispatch = null,
     ): BlueGreenProxyState {
         if ($inspection->replacementState === null
             || $inspection->journalBootId === null
@@ -346,6 +381,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         $operationFence->assertLockOwnership();
 
         try {
+            $archiveDispatch?->markDispatched();
             $finalizedReplacement = $reader->finalizePendingReplacementSidecar(
                 $server,
                 $application,
@@ -382,7 +418,7 @@ class RecoverCleanIdleBlueGreenContainerMutationJournal
         return $postArchiveState;
     }
 
-    private function inactiveRetirementIsTerminalOrCleared(ApplicationBlueGreenDeployment $state): bool
+    private static function inactiveRetirementIsTerminalOrCleared(ApplicationBlueGreenDeployment $state): bool
     {
         foreach (ApplicationBlueGreenDeployment::clearedInactiveRetirementAttributes() as $attribute => $expected) {
             if ($state->getAttribute($attribute) !== $expected) {
