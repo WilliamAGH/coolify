@@ -626,7 +626,7 @@ class WriteBlueGreenProxyConfiguration
         bool $allowPendingSameBootJournal,
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
-        string $expectedMutationSha256,
+        array $expectedMutationSha256,
         string $expectedCompletionSha256,
         array $backendPorts,
         string $targetContainerName,
@@ -679,7 +679,7 @@ class WriteBlueGreenProxyConfiguration
         bool $allowPendingSameBootJournal,
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
-        string $expectedMutationSha256,
+        array $expectedMutationSha256,
         string $expectedCompletionSha256,
         array $backendPorts,
         string $targetContainerName,
@@ -730,7 +730,7 @@ class WriteBlueGreenProxyConfiguration
     public function staleInactiveRetirementContainerMutationJournalProvenanceSha256For(
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
-        string $expectedMutationSha256,
+        array $expectedMutationSha256,
         string $expectedCompletionSha256,
         array $backendPorts,
         string $targetContainerName,
@@ -2140,7 +2140,9 @@ class WriteBlueGreenProxyConfiguration
             'test "$container_journal_replacement_state_checksum" = '.escapeshellarg(hash('sha256', $replacementState->serialize())),
             'test "$container_journal_managed_file_state" = present',
             'test "$container_journal_managed_checksum" = '.escapeshellarg($expectedState->managedSha256),
-            'test "$container_journal_mutation_checksum" = '.escapeshellarg($profile['expected_mutation_sha256']),
+            'case "$container_journal_mutation_checksum" in '
+                .implode('|', array_map(escapeshellarg(...), $profile['expected_mutation_sha256']))
+                .') ;; *) exit 1 ;; esac',
             'test "$container_journal_completion_checksum" = '.escapeshellarg($profile['expected_completion_sha256']),
             'container_journal_expected_state_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-expected.XXXXXX")',
             'container_journal_replacement_decoded=$(mktemp "$container_journal_state_directory/.blue-green-stale-container-replacement.XXXXXX")',
@@ -2643,7 +2645,7 @@ class WriteBlueGreenProxyConfiguration
      *     connection_observation_command: string,
      *     expected_completion_sha256: string,
      *     expected_journal_boot_id: string,
-     *     expected_mutation_sha256: string,
+     *     expected_mutation_sha256: list<string>,
      *     expected_state: BlueGreenProxyState,
      *     inactive_color: BlueGreenDeploymentColor,
      *     inactive_deployment_uuid: string,
@@ -2660,7 +2662,7 @@ class WriteBlueGreenProxyConfiguration
         bool $allowPendingSameBootJournal,
         BlueGreenProxyState $expectedState,
         BlueGreenProxyState $replacementState,
-        string $expectedMutationSha256,
+        array $expectedMutationSha256,
         string $expectedCompletionSha256,
         array $backendPorts,
         string $targetContainerName,
@@ -2676,7 +2678,20 @@ class WriteBlueGreenProxyConfiguration
             && ! hash_equals($expectedCurrentBootId, $expectedJournalBootId)) {
             throw new InvalidArgumentException('Only the current-boot inactive-retirement journal can use the pending same-boot recovery profile.');
         }
-        $this->assertSha256($expectedMutationSha256, 'stale inactive-retirement mutation');
+        // One destination's drain has more than one legitimate preimage: the
+        // generator that strands a journal and the generator that replaced it
+        // emit different bytes for the same durable inputs. Every candidate is
+        // reconstructed from those inputs, and the journal's own recorded
+        // checksum is what selects among them, so widening the set never
+        // widens what can be replayed.
+        $expectedMutationSha256 = array_values(array_unique($expectedMutationSha256));
+        sort($expectedMutationSha256);
+        if ($expectedMutationSha256 === []) {
+            throw new InvalidArgumentException('The stale inactive-retirement mutation has no reconstructed preimage.');
+        }
+        foreach ($expectedMutationSha256 as $candidate) {
+            $this->assertSha256($candidate, 'stale inactive-retirement mutation');
+        }
         $this->assertSha256($expectedCompletionSha256, 'stale inactive-retirement completion');
         if ($expectedState->managedSha256 === null
             || $expectedState->activeColor === null
@@ -2716,7 +2731,7 @@ class WriteBlueGreenProxyConfiguration
             self::STALE_INACTIVE_RETIREMENT_JOURNAL_PROVENANCE_MAGIC,
             hash('sha256', $expectedState->serialize()),
             hash('sha256', $replacementState->serialize()),
-            $expectedMutationSha256,
+            implode(',', $expectedMutationSha256),
             $expectedCompletionSha256,
             $targetContainerName,
             $targetContainerId,

@@ -5446,9 +5446,10 @@ function authenticatedMatureInactiveRetirementJournal(
     Application $application,
     ApplicationDeploymentQueue $owner,
     ApplicationBlueGreenDeployment $state,
-    string $currentBootId,
-    string $journalBootId,
-    bool $hasInitialZeroObservation,
+    string $currentBootId = '11111111-2222-3333-4444-555555555555',
+    string $journalBootId = '11111111-2222-3333-4444-555555555555',
+    bool $hasInitialZeroObservation = false,
+    bool $preFixGenerator = true,
 ): array {
     $state = $state->fresh() ?? throw new RuntimeException('The mature inactive-retirement state disappeared while rebuilding its journal.');
     $owner = $owner->fresh() ?? throw new RuntimeException('The mature inactive-retirement owner disappeared while rebuilding its journal.');
@@ -5540,11 +5541,22 @@ SH;
         || substr_count($commands[$scriptIndex], $currentDeadlineBlock) !== 1) {
         throw new RuntimeException('The affected inactive-retirement drain journal no longer has its exact pre-fix deadline block.');
     }
-    $commands[$scriptIndex] = str_replace(
+    $currentCommands = $commands;
+    $affectedCommands = $commands;
+    $affectedCommands[$scriptIndex] = str_replace(
         $currentDeadlineBlock,
         $preFixDeadlineBlock,
-        $commands[$scriptIndex],
+        $affectedCommands[$scriptIndex],
     );
+    $currentMutationScript = implode("\n", ['set -eu', ...$currentCommands])."\n";
+    $affectedMutationScript = implode("\n", ['set -eu', ...$affectedCommands])."\n";
+    // Both generators' scripts always exist as candidates, whichever one this
+    // journal happens to carry -- that is exactly what the writer reconstructs.
+    $commands = $preFixGenerator ? $affectedCommands : $currentCommands;
+    // The journal itself carries the pre-fix generator's script -- that
+    // generator is what strands these journals. Recovery reconstructs both
+    // generators' scripts and lets the journal's checksum select, so the
+    // provenance covers the whole candidate set exactly as the writer does.
     $mutationScript = implode("\n", ['set -eu', ...$commands])."\n";
     $completionScript = implode("\n", [
         'set -eu',
@@ -5553,6 +5565,11 @@ SH;
     $expectedStateSha256 = hash('sha256', $expectedState->serialize());
     $replacementStateSha256 = hash('sha256', $replacementState->serialize());
     $mutationSha256 = hash('sha256', $mutationScript);
+    $mutationSha256Candidates = array_values(array_unique([
+        hash('sha256', $currentMutationScript),
+        hash('sha256', $affectedMutationScript),
+    ]));
+    sort($mutationSha256Candidates);
     $completionSha256 = hash('sha256', $completionScript);
     $connectionObservationCommand = $drainer->observationCommandFor($target, $inventory->ports());
     $journal = implode("\n", [
@@ -5574,7 +5591,7 @@ SH;
         'coolify-blue-green-stale-inactive-retirement-journal-provenance-v1',
         $expectedStateSha256,
         $replacementStateSha256,
-        $mutationSha256,
+        implode(',', $mutationSha256Candidates),
         $completionSha256,
         $target->name,
         $target->dockerId,
@@ -6238,6 +6255,39 @@ it('rejects an immature or unexpired intervention before journal inspection', fu
  * every row that has it. Recovery gates on the flag and an expired dispatch
  * reservation, never on the attempt count.
  */
+/**
+ * A journal written by the current generator must authenticate exactly as one
+ * written by the affected generator does. Application iugvhgssydgf5j9shvexgx6e
+ * stranded on precisely this: recovery reconstructed only the affected form, so
+ * the current-form journal its own deployment had written could never match.
+ */
+it('authenticates a mature journal written by either drain generator', function (bool $preFixGenerator): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
+    $journal = authenticatedMatureInactiveRetirementJournal(
+        $application,
+        $owner,
+        $state->fresh(),
+        preFixGenerator: $preFixGenerator,
+    );
+    Queue::fake();
+    $payloads = [];
+    $archived = false;
+    fakeAuthenticatedMatureInactiveRetirementJournalRemote($payloads, $archived, 'absent', $journal);
+
+    $result = RecoverBlueGreenIntervention::run(
+        stateId: $state->id,
+        apply: true,
+        reason: 'Authenticate a mature journal from either drain generator.',
+        staleContainerJournal: true,
+    );
+
+    expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::RECOVERED)
+        ->and($archived)->toBeTrue();
+})->with([
+    'stranded by the affected generator' => true,
+    'stranded by the current generator' => false,
+]);
+
 it('recovers an intervened retirement whose attempts never reached the retry budget', function (int $attempts): void {
     ['owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
     $state->update(['inactive_retirement_attempts' => $attempts]);

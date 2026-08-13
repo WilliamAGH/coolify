@@ -1928,7 +1928,7 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         allowPendingSameBootJournal: true,
         expectedState: $expectedState,
         replacementState: $replacementState,
-        expectedMutationSha256: str_repeat('d', 64),
+        expectedMutationSha256: [str_repeat('d', 64)],
         expectedCompletionSha256: str_repeat('e', 64),
         backendPorts: [8080],
         targetContainerName: 'app-fenced-blue',
@@ -1941,7 +1941,10 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
 
     expect($command)->toContain('test "$container_journal_expected_state" = '.escapeshellarg(base64_encode($expectedState->serialize())))
         ->and($command)->toContain('test "$container_journal_replacement_state" = '.escapeshellarg(base64_encode($replacementState->serialize())))
-        ->and($command)->toContain('test "$container_journal_mutation_checksum" = '.escapeshellarg(str_repeat('d', 64)))
+        // The drain has more than one legitimate preimage, so the mutation
+        // checksum is matched against the reconstructed candidate set and the
+        // journal's own recorded value selects among them.
+        ->and($command)->toContain('case "$container_journal_mutation_checksum" in '.escapeshellarg(str_repeat('d', 64)).') ;; *) exit 1 ;; esac')
         ->and($command)->toContain('test "$container_journal_completion_checksum" = '.escapeshellarg(str_repeat('e', 64)))
         ->and($command)->toContain('test "$container_journal_expected_boot_id" = '.escapeshellarg(destinationFenceBootId()))
         ->and($command)->toContain('coolify.blueGreen.deploymentUuid=retirement-inactive')
@@ -1964,7 +1967,7 @@ it('builds a mature inactive-retirement journal inspection that cannot replay it
         allowPendingSameBootJournal: true,
         expectedState: $expectedState,
         replacementState: $replacementState,
-        expectedMutationSha256: str_repeat('d', 64),
+        expectedMutationSha256: [str_repeat('d', 64)],
         expectedCompletionSha256: str_repeat('e', 64),
         backendPorts: [8080],
         targetContainerName: 'app-fenced-blue',

@@ -2143,7 +2143,20 @@ final class RecoverBlueGreenIntervention
         );
     }
 
-    /** @return array{string, string} */
+    /**
+     * Every drain script this destination's journal could legitimately hold.
+     *
+     * A journal is stranded by the generator that was deployed when it was
+     * written, and that generator has changed: the affected one timed out even
+     * at zero connections -- the fault that strands these journals in the first
+     * place -- and the current one breaks out instead. Both emit different bytes
+     * for the same durable inputs, so recovery reconstructs both from those
+     * inputs and lets the journal's own recorded checksum select. Reconstructing
+     * only one form made every journal written by the other permanently
+     * unrecoverable, which is what stranded application iugvhgssydgf5j9shvexgx6e.
+     *
+     * @return array{list<string>, string}
+     */
     private function staleInactiveRetirementJournalScriptSha256(
         BlueGreenContainerExpectation $target,
         BlueGreenBackendPortInventory $inventory,
@@ -2177,18 +2190,26 @@ SH;
             || substr_count($commands[$scriptIndex], $currentDeadlineBlock) !== 1) {
             throw new BlueGreenDeploymentTransitionException('The affected inactive-retirement journal generator can no longer be reconstructed exactly.');
         }
-        $commands[$scriptIndex] = str_replace(
+        $currentCommands = $commands;
+        $affectedCommands = $commands;
+        $affectedCommands[$scriptIndex] = str_replace(
             $currentDeadlineBlock,
             $affectedDeadlineBlock,
-            $commands[$scriptIndex],
+            $affectedCommands[$scriptIndex],
         );
-        $mutationScript = implode("\n", ['set -eu', ...$commands])."\n";
+        $mutationSha256 = array_map(
+            static fn (array $generated): string => hash(
+                'sha256',
+                implode("\n", ['set -eu', ...$generated])."\n",
+            ),
+            [$currentCommands, $affectedCommands],
+        );
         $completionScript = implode("\n", [
             'set -eu',
             ...$drainer->completionAssertionsFor($target),
         ])."\n";
 
-        return [hash('sha256', $mutationScript), hash('sha256', $completionScript)];
+        return [$mutationSha256, hash('sha256', $completionScript)];
     }
 
     /** @param array{inactive_retirement: array<string, mixed>, state: ApplicationBlueGreenDeployment} $context */
