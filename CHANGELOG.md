@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.87-fork] - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Authenticate a stale drain journal from either generator
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Pin the two-candidate mutation assertion, and correct its docs
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.87-fork
+
 ## [4.13.86-fork] - 2026-08-13
 
 ### 📚 Documentation
