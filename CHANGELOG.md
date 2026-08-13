@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.89-fork] - 2026-08-13
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(blue-green)* Give the PostgreSQL lane a budget it fits in
+- *(release)* Prepare 4.13.89-fork
+
 ## [4.13.88-fork] - 2026-08-13
 
 ### 🐛 Bug Fixes
