@@ -1,10 +1,14 @@
 <?php
 
+use App\Actions\Application\BlueGreen\AttestBlueGreenDestinationState;
 use App\Actions\Application\BlueGreen\BlueGreenDeploymentTransitionException;
+use App\Actions\Application\BlueGreen\BlueGreenPendingContainerMutationJournalException;
 use App\Actions\Application\BlueGreen\BlueGreenSteadyStateRepairResult;
 use App\Actions\Application\BlueGreen\RecoverCleanIdleBlueGreenContainerMutationJournal;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\RepairBlueGreenSteadyStates;
+use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
+use App\Actions\Proxy\WriteBlueGreenProxyConfiguration;
 use App\Enums\ApplicationDeploymentStatus;
 use App\Enums\BlueGreenDeploymentPhase;
 use App\Models\ApplicationBlueGreenDeployment;
@@ -134,4 +138,60 @@ it('refuses a non-positive application scope option', function (): void {
 
     expect(fn () => $this->artisan('blue-green:repair-steady', ['--application' => '0']))
         ->toThrow(InvalidArgumentException::class, 'The --application option must be a positive integer.');
+});
+
+it('keeps the fence condition legible through an intermediate rethrow that rewords it', function (): void {
+    $fenced = new BlueGreenPendingContainerMutationJournalException(
+        WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+    );
+    $reworded = new BlueGreenPendingContainerMutationJournalException(
+        'The remote destination has a pending container mutation journal without one clean IDLE recovery owner.',
+        previous: $fenced,
+    );
+    $wrappedInUntypedRethrow = new BlueGreenDeploymentTransitionException(
+        'Some later lane restated this failure without the marker.',
+        previous: $reworded,
+    );
+
+    expect(BlueGreenPendingContainerMutationJournalException::fencesManagedRoute($reworded))->toBeTrue()
+        ->and(BlueGreenPendingContainerMutationJournalException::fencesManagedRoute($wrappedInUntypedRethrow))->toBeTrue()
+        ->and(BlueGreenPendingContainerMutationJournalException::fencesManagedRoute(
+            new BlueGreenDeploymentTransitionException('An unrelated repair failure.'),
+        ))->toBeFalse()
+        ->and(BlueGreenPendingContainerMutationJournalException::fencesManagedRoute(null))->toBeFalse();
+});
+
+/**
+ * The producer half of the same defect. A canonical destination reaches the
+ * fence through MigrateBlueGreenReleasedV3ProxyState, which attests with a null
+ * durable state, so clean IDLE recovery has no owner to hand it to. Attestation
+ * rethrew that as an untyped transition exception whose message dropped the
+ * marker, and every lane deciding on the condition downstream went blind.
+ */
+it('keeps a journal-fenced canonical attestation typed when it has no clean IDLE recovery owner', function (): void {
+    $scenario = journalConvergenceIdleScenario();
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $scenario->application,
+        $scenario->destination,
+        $scenario->state->fresh(),
+    ) ?? throw new RuntimeException('The convergence fixture requires an exact managed route.');
+    Process::fake(fn (): mixed => Process::result(
+        errorOutput: WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
+        exitCode: 75,
+    ));
+
+    $attest = fn (): mixed => AttestBlueGreenDestinationState::run(
+        $scenario->server,
+        $scenario->application,
+        $scenario->destination,
+        null,
+        $expectedState,
+    );
+
+    expect($attest)->toThrow(BlueGreenPendingContainerMutationJournalException::class);
+    try {
+        $attest();
+    } catch (Throwable $thrown) {
+        expect(BlueGreenPendingContainerMutationJournalException::fencesManagedRoute($thrown))->toBeTrue();
+    }
 });

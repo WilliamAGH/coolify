@@ -58,10 +58,7 @@ final class AttestBlueGreenDestinationState
                 $server,
             ));
         } catch (RuntimeException $exception) {
-            if (str_contains(
-                $exception->getMessage(),
-                WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
-            )) {
+            if (BlueGreenPendingContainerMutationJournalException::fencesManagedRoute($exception)) {
                 return $this->recoverPendingJournal($server, $application, $destination, $state, $exception);
             }
             if (! $mayDiscoverReleasedState || $state === null || $expectedState === null) {
@@ -84,10 +81,7 @@ final class AttestBlueGreenDestinationState
                     $server,
                 ));
             } catch (RuntimeException $releasedException) {
-                if (str_contains(
-                    $releasedException->getMessage(),
-                    WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT,
-                )) {
+                if (BlueGreenPendingContainerMutationJournalException::fencesManagedRoute($releasedException)) {
                     return $this->recoverPendingJournal(
                         $server,
                         $application,
@@ -124,7 +118,12 @@ final class AttestBlueGreenDestinationState
             );
         }
 
-        throw new BlueGreenDeploymentTransitionException(
+        // Keep the typed carrier. A caller deciding whether a journal fences
+        // this destination must still be able to tell, and rewording the
+        // condition into an untyped transition exception is precisely what
+        // stopped blue-green:repair-steady from ever reaching clean IDLE
+        // journal recovery on a canonical destination.
+        throw new BlueGreenPendingContainerMutationJournalException(
             'The remote destination has a pending container mutation journal without one clean IDLE recovery owner.',
             previous: $exception,
         );

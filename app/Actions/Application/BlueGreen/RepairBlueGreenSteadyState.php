@@ -181,7 +181,7 @@ class RepairBlueGreenSteadyState
         } catch (BlueGreenOperationFenceLostException) {
             return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::DEFERRED, 'Lifecycle ownership changed during steady-state repair.');
         } catch (Throwable $exception) {
-            if (str_contains($exception->getMessage(), WriteBlueGreenProxyConfiguration::PENDING_CONTAINER_MUTATION_JOURNAL_OUTPUT)) {
+            if (BlueGreenPendingContainerMutationJournalException::fencesManagedRoute($exception)) {
                 return new BlueGreenSteadyStateRepairResult($stateId, BlueGreenSteadyStateRepairResult::PENDING_CONTAINER_JOURNAL, 'A container-mutation journal fences the IDLE route; clean-idle journal recovery owns it.');
             }
 
