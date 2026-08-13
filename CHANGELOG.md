@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.88-fork] - 2026-08-13
+
+### 🐛 Bug Fixes
+
+- *(deps)* Take the patched nanoid transitive resolution
+
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.88-fork
+
 ## [4.13.87-fork] - 2026-08-13
 
 ### 🐛 Bug Fixes
