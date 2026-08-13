@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [unreleased]
+## [4.13.85-fork] - 2026-08-13
 
 ### 🐛 Bug Fixes
 
@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - *(blue-green)* Decide the container-journal fence on one owned predicate
 - *(blue-green)* Stop paging on a refusal a later profile resolved
 - *(blue-green)* Never lose the record of an archive whose outcome is unproven
+- *(blue-green)* Report every unproven archive, and stop modelling a stale gate
 
 ### 📚 Documentation
 
@@ -19,6 +20,11 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.85-fork
 
 ## [4.13.84-fork] - 2026-08-12
 
