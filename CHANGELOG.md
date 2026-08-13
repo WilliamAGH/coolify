@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.13.86-fork] - 2026-08-13
+
+### 📚 Documentation
+
+- Update changelog
+
+### 🧪 Testing
+
+- *(blue-green)* Assert the typed fence attestation throws
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.86-fork
+
 ## [4.13.85-fork] - 2026-08-13
 
 ### 🐛 Bug Fixes
