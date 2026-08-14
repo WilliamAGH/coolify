@@ -158,6 +158,7 @@ function loginAsRoot(): mixed
 - PHP 8.5: constructor property promotion, explicit return types, type hints
 - Validation uses inline `Validator` facade in controllers/Livewire components and custom rules in `app/Rules/` — not Form Request classes
 - Run `vendor/bin/pint --dirty --format agent` before finalizing changes; finalization then commits, pushes `staging`, and watches the pushed workflow run(s) to a terminal verdict — a deploy is verified by confirming the digest-swapped instance serves the fix
+- GitHub issues are filed only for material defects or features (behavior, correctness, security, performance, data quality, or a governed contract); pedantic/nitpick/style-only findings are fixed in place or dropped, never filed. Fixes and issue scope follow the minimalism bar — reuse before new code and simplify before completing, per the `ponytail` and `ce-simplify-code` skills
 - Every change must have tests — write or update tests, then run them. For bug fixes, follow TDD: write a failing test first, then fix the bug (see Test Enforcement below)
 - Check sibling files for conventions before creating new files
 
