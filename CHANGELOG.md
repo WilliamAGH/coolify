@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 ### 📚 Documentation
 
 - Update changelog
+- Update changelog
+- *(agents)* Encode worktree task lifecycle, CI watch, and completion tail
 
 ## [4.13.89-fork] - 2026-08-13
 
