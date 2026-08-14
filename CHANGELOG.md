@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 - Update changelog
 - Update changelog
 - *(agents)* Encode worktree task lifecycle, CI watch, and completion tail
+- Update changelog
+- *(agents)* Gate issue filing on materiality and minimalism compliance
 
 ## [4.13.89-fork] - 2026-08-13
 
