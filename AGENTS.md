@@ -157,14 +157,14 @@ function loginAsRoot(): mixed
 - Use Eloquent relationships, avoid `DB::` facade — prefer `Model::query()`
 - PHP 8.5: constructor property promotion, explicit return types, type hints
 - Validation uses inline `Validator` facade in controllers/Livewire components and custom rules in `app/Rules/` — not Form Request classes
-- Run `vendor/bin/pint --dirty --format agent` before finalizing changes
+- Run `vendor/bin/pint --dirty --format agent` before finalizing changes; finalization then commits, pushes `staging`, and watches the pushed workflow run(s) to a terminal verdict — a deploy is verified by confirming the digest-swapped instance serves the fix
 - Every change must have tests — write or update tests, then run them. For bug fixes, follow TDD: write a failing test first, then fix the bug (see Test Enforcement below)
 - Check sibling files for conventions before creating new files
 
 ## Git Workflow
 
-- Working branch: `staging` — ALWAYS. Every commit and every push goes to `staging`. Never create, switch to, or push any other branch, and never open pull requests for routine work in this repo.
-- Releases ship directly from `staging`: bump `config/constants.php` + `versions.json` to `X.Y.Z-fork`, push `staging`, then push a signed `X.Y.Z-fork` tag on that commit. `publish-fork.yml` verifies staging ancestry and the allowed-signer tag signature, runs application validation from the tag, and publishes the images. Deploying = digest swap in `/data/coolify/source/docker-compose.custom.yml` on the control plane.
+- Integration branch: `staging`. Task work happens in a dedicated worktree branch created at task start (review/read-only tasks exempt); commits land in that worktree, and task conclusion merges the worktree commits (non-force) into the local `staging` in the primary tree and removes the worktree. Only `staging` (and release tags) are ever pushed — never push any other branch, and never open pull requests for routine work in this repo.
+- Releases ship directly from `staging`: bump `config/constants.php` + `versions.json` to `X.Y.Z-fork`, push `staging`, then push a signed `X.Y.Z-fork` tag on that commit. `publish-fork.yml` verifies staging ancestry and the allowed-signer tag signature, runs application validation from the tag, and publishes the images. Deploying = digest swap in `/data/coolify/source/docker-compose.custom.yml` on the control plane. Watch every pushed `staging`/tag workflow run to a terminal verdict; fix and re-push until green.
 - `v4.x` is the legacy default branch (ruleset-locked to PR + "Application validation"); it is no longer part of the working or release path — do not target it. `next` is upstream's development branch — untouched.
 - Before any commit/tag/release work, run `scripts/dev/assert-branch-current.sh` (add `--require-clean` before tagging) — it fails when local HEAD is behind origin or the tree is dirty.
 - Treat shared production infrastructure as read-only during repository work. A failing CI or release check does not authorize changes to Nexus repository policies, registry routing or authentication, Coolify service configuration, DNS, GitHub rulesets, or Actions runner groups.
