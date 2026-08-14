@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [unreleased]
+
+### 🐛 Bug Fixes
+
+- *(blue-green)* Leave every inactive-retirement row to the mature profile
+
+### 📚 Documentation
+
+- Update changelog
+
 ## [4.13.89-fork] - 2026-08-13
 
 ### 📚 Documentation
