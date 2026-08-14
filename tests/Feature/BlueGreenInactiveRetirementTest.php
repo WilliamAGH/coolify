@@ -6272,7 +6272,7 @@ it('rejects an immature or unexpired intervention before journal inspection', fu
  * no profile can retire it, and the completed-mutation profile must not claim
  * the row and clear the journal fence that surfaces it.
  */
-it('owns a fully populated terminal retirement whose target is running again', function (): void {
+it('refuses a fully populated terminal retirement whose target is running again', function (): void {
     ['application' => $application, 'owner' => $owner, 'state' => $state] = makeRecoverableMatureInactiveRetirementJournal();
     $state->update([
         'inactive_retirement_stopped_at' => now()->subMinute(),
@@ -6288,18 +6288,17 @@ it('owns a fully populated terminal retirement whose target is running again', f
     $result = RecoverBlueGreenIntervention::run(
         stateId: $state->id,
         apply: true,
-        reason: 'Prove a leaked unrouted container keeps its journal fence.',
+        reason: 'Prove the mature profile refuses a running retired target without archiving.',
         staleContainerJournal: true,
     );
 
     expect($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
         ->and($archived)->toBeFalse()
-        // The refusal stands. The completed-mutation profile never inspects a
-        // row that still names an inactive retirement, so it cannot clear the
-        // journal fence that surfaces the leak.
+        // It reached the remote inspection -- the window that had no coverage --
+        // rather than stopping in the durable context builder.
         ->and($payloads)->not->toBeEmpty()
         ->and(implode("\n", $payloads))
-        ->not->toContain(WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_INSPECTION_OUTPUT_PREFIX);
+        ->toContain(WriteBlueGreenProxyConfiguration::STALE_CONTAINER_MUTATION_JOURNAL_OUTPUT_PREFIX);
 });
 
 it('authenticates a mature journal written by either drain generator', function (bool $preFixGenerator): void {

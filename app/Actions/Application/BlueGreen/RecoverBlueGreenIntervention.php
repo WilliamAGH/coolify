@@ -77,6 +77,7 @@ final class RecoverBlueGreenIntervention
     {
         return $state->phase === BlueGreenDeploymentPhase::IDLE
             && $state->supersession_generation === 1
+            && $state->inactive_retirement_owner_deployment_uuid === null
             && $state->intervention_phase === null
             && $state->intervention_reason === null
             && is_string($state->legacy_container_name)
@@ -751,16 +752,13 @@ final class RecoverBlueGreenIntervention
      * owner's, so a row it would refuse is rejected here without one remote
      * call.
      *
-     * A row still naming an inactive retirement belongs to the mature profile
-     * alone, whatever that profile decides. Its refusals are not all failures
-     * of recovery: a terminal retirement whose target is running again is a
-     * leaked unrouted container, and neither profile can retire it, so claiming
-     * that row here would only clear the journal fence that surfaces it. The
-     * fence is a poor alarm — it blocks every deploy for the application — but
-     * silently trading it for nothing is worse, and the retirement owner is
-     * where that shape has to be answered. Nothing is stranded by declining:
-     * the clean IDLE owner still reaches those rows through ordinary
-     * attestation on the next deploy and through blue-green:repair-steady.
+     * A row still naming an inactive retirement is deliberately NOT excluded.
+     * This profile only routes to the clean IDLE owner, which decides durable
+     * candidacy itself, and blue-green:repair-steady reaches that same owner
+     * for the same rows every five minutes. Declining here would refuse an
+     * operator a recovery the scheduler performs anyway minutes later, and
+     * would not preserve the journal fence as a signal for anything: no caller
+     * of that owner inspects whether the retired container is running.
      *
      * The destination scope is this command's own, unchanged: every profile it
      * offers acts only on one exact primary Traefik destination, and reaching
@@ -775,7 +773,6 @@ final class RecoverBlueGreenIntervention
         return $scope['application']->blueGreenPrimaryStandaloneDockerDestinationId() === (int) $scope['destination']->id
             && (int) $scope['destination']->server_id === (int) $scope['server']->id
             && $scope['server']->proxyType() === ProxyTypes::TRAEFIK->value
-            && $state->inactive_retirement_owner_deployment_uuid === null
             && $state->active_color !== null
             && $state->managed_file_sha256 !== null
             && ResolveBlueGreenExpectedProxyState::hasDurableDestinationState($state)

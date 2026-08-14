@@ -1213,11 +1213,10 @@ function completedContainerMutationJournalScenario(): BlueGreenRecoveryScenario
 }
 
 /**
- * A routed IDLE row that still names an inactive-retirement owner. The mature
- * profile owns every such row, so this profile declines it whatever the mature
- * profile decided -- including a refusal, because a refusal there can mean a
- * leaked unrouted container that no profile can retire, and clearing its
- * journal fence would only hide that.
+ * A routed IDLE row that still names an inactive-retirement owner, terminal.
+ * The mature profile is reached first and refuses it on durable shape, and this
+ * profile then recovers it -- the same archival blue-green:repair-steady would
+ * perform for the row within five minutes through the same owner.
  */
 function completedContainerMutationJournalScenarioWithTerminalRetirement(): BlueGreenRecoveryScenario
 {
@@ -1413,7 +1412,7 @@ it('archives a completed container-mutation journal so the destination route is 
         );
 });
 
-it('declines a row that still names an inactive retirement, leaving it to the mature profile', function (bool $apply): void {
+it('recovers a routed row that still names a terminal inactive retirement', function (bool $apply): void {
     $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
     $expectedState = completedContainerMutationExpectedState($scenario);
     $journalPresent = true;
@@ -1427,23 +1426,29 @@ it('declines a row that still names an inactive retirement, leaving it to the ma
         $payloads,
         $journalPresent,
     );
-    // Never reached: the row is declined before any runtime is inspected.
-    InspectBlueGreenContainer::shouldRun()->never();
+    InspectBlueGreenContainer::shouldRun()
+        ->once()
+        ->andReturn(new BlueGreenContainerInspection(
+            exists: true,
+            dockerId: $expectedState->activeContainerId,
+            status: 'running',
+            health: 'healthy',
+        ));
     $stateBefore = $scenario->state->fresh()->getAttributes();
 
     $result = RecoverBlueGreenIntervention::run(
         stateId: $scenario->state->id,
         apply: $apply,
-        reason: $apply ? 'Prove a retirement-owning row is declined rather than claimed.' : null,
+        reason: $apply ? 'Archive a completed journal on a row that still names a terminal retirement.' : null,
         staleContainerJournal: true,
     );
 
     expect($result->classification)->toBe(BlueGreenInterventionRecoveryResult::STALE_CONTAINER_JOURNAL)
-        ->and($result->outcome)->toBe(BlueGreenInterventionRecoveryResult::MANUAL_ONLY)
-        ->and($journalPresent)->toBeTrue()
-        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore)
-        // Declined on durable shape alone: the destination is never probed.
-        ->and($payloads)->toBeEmpty();
+        ->and($result->outcome)->toBe($apply
+            ? BlueGreenInterventionRecoveryResult::RECOVERED
+            : BlueGreenInterventionRecoveryResult::INSPECTED)
+        ->and($journalPresent)->toBe(! $apply)
+        ->and($scenario->state->fresh()->getAttributes())->toBe($stateBefore);
 })->with([
     'inspection' => false,
     'archival' => true,
@@ -1668,9 +1673,7 @@ it('reports its own probe failure instead of handing back an earlier profile ref
 });
 
 it('does not page an operator with an earlier profile refusal that the completed-mutation profile then resolved', function (): void {
-    // A routed IDLE row with its retirement provenance cleared: the profiles
-    // above refuse it on durable shape, and this one owns and recovers it.
-    $scenario = completedContainerMutationJournalScenario();
+    $scenario = completedContainerMutationJournalScenarioWithTerminalRetirement();
     $expectedState = completedContainerMutationExpectedState($scenario);
     $journalPresent = true;
     $payloads = [];
