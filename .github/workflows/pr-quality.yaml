@@ -19,7 +19,7 @@ jobs:
           max-failures: 4
 
           # PR Branch Checks
-          allowed-target-branches: "next"
+          allowed-target-branches: ${{ github.repository == 'williamacallahan/coolify' && 'main' || 'next' }}
           blocked-target-branches: ""
           allowed-source-branches: ""
           blocked-source-branches: |

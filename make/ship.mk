@@ -1,7 +1,7 @@
-# Publish an exact signed fork release from the staging tip.
+# Publish an exact signed fork release from the main tip.
 .PHONY: ship ship-status
 
-ship: ## Sign, push, and watch a fork tag from clean staging (SHIP_DRY_RUN=1 previews only)
+ship: ## Sign, push, and watch a fork tag from clean main (SHIP_DRY_RUN=1 previews only)
 	@SHIP_STATUS_DISCOVERY_ATTEMPTS='$(SHIP_STATUS_DISCOVERY_ATTEMPTS)' \
 	  SHIP_STATUS_DISCOVERY_DELAY_SECONDS='$(SHIP_STATUS_DISCOVERY_DELAY_SECONDS)' \
 	  SHIP_STATUS_LIMIT='$(SHIP_STATUS_LIMIT)' \

@@ -410,8 +410,8 @@ validate_docker_alias_before_copy_failure_injection() {
         || die 'release failure injection requires the williamacallahan/coolify repository'
     [[ "${GITHUB_EVENT_NAME:-}" == 'repository_dispatch' ]] \
         || die 'release failure injection requires a repository_dispatch event'
-    [[ "${GITHUB_REF:-}" == 'refs/heads/v4.x' ]] \
-        || die 'release failure injection requires refs/heads/v4.x'
+    [[ "${GITHUB_REF:-}" == 'refs/heads/main' ]] \
+        || die 'release failure injection requires refs/heads/main'
     [[ "${GITHUB_REF_PROTECTED:-}" == 'true' ]] \
         || die 'release failure injection requires a protected ref'
 

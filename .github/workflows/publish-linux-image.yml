@@ -153,7 +153,7 @@ jobs:
             require_dockerhub_credentials
             [ "$REPOSITORY" = 'williamacallahan/coolify' ]
             [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]
-            [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
+            [ "$GITHUB_REF" = 'refs/heads/main' ]
             [ "$GITHUB_REF_PROTECTED" = true ]
             printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
             [ "$DOCKERFILE" = 'docker/production/Dockerfile' ]
@@ -912,7 +912,7 @@ jobs:
           set -eu
           [ "$GITHUB_REPOSITORY" = 'williamacallahan/coolify' ]
           [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]
-          [ "$GITHUB_REF" = 'refs/heads/v4.x' ]
+          [ "$GITHUB_REF" = 'refs/heads/main' ]
           [ "$REF_PROTECTED" = true ]
           [ "$OPERATIONAL_SCENARIO" = 'issue7-staging-failed-build' ]
           echo 'Injecting the issue #7 post-gate build failure before any registry publication.' >&2

@@ -603,7 +603,7 @@ failure_issue18_docker='docker.io/williamagh/coolify-remediation-issue18'
 export PUBLISH_LINUX_IMAGE_FAILURE_INJECTION='docker-alias-before-copy'
 export GITHUB_REPOSITORY='williamacallahan/coolify'
 export GITHUB_EVENT_NAME='repository_dispatch'
-export GITHUB_REF='refs/heads/v4.x'
+export GITHUB_REF='refs/heads/main'
 export GITHUB_REF_PROTECTED='true'
 
 assert_failure_injection_refusal \
@@ -621,7 +621,7 @@ assert_failure_injection_refusal \
 assert_failure_injection_refusal \
     'wrong GitHub ref context' \
     "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \
-    GITHUB_REF='refs/heads/not-v4.x'
+    GITHUB_REF='refs/heads/not-main'
 assert_failure_injection_refusal \
     'unprotected GitHub ref context' \
     "$failure_issue7_ghcr" "$failure_issue7_docker" "$new_index" 42 \

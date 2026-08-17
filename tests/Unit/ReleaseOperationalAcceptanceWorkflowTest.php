@@ -611,7 +611,7 @@ function runReleaseOperationalAcceptanceAuthorization(array $payload, array $con
             'GITHUB_EVENT_NAME' => 'repository_dispatch',
             'GITHUB_EVENT_PATH' => $eventPath,
             'GITHUB_OUTPUT' => $githubOutput,
-            'GITHUB_REF' => 'refs/heads/v4.x',
+            'GITHUB_REF' => 'refs/heads/main',
             'GITHUB_REF_PROTECTED' => 'true',
             'GITHUB_REPOSITORY' => 'williamacallahan/coolify',
             'GITHUB_RUN_ID' => '101',
@@ -786,7 +786,7 @@ it('rejects every unauthorized repository dispatch dimension', function (array $
     'wrong ref' => [[
         'scenario' => 'issue7-staging-success',
         'source_sha' => str_repeat('a', 40),
-    ], ['GITHUB_REF' => 'refs/heads/main']],
+    ], ['GITHUB_REF' => 'refs/heads/not-main']],
     'unprotected ref' => [[
         'scenario' => 'issue7-staging-success',
         'source_sha' => str_repeat('a', 40),

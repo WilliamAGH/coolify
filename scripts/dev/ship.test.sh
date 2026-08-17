@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Contract tests for the staging-only signed fork release entrypoint.
+# Contract tests for the main-only signed fork release entrypoint.
 set -Eeuo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,7 +83,7 @@ case "${1:-}" in
 symbolic-ref)
   [ "$*" = 'symbolic-ref --quiet --short HEAD' ] || exit 2
   [ "${MOCK_DETACHED:-0}" != 1 ] || exit 1
-  printf '%s\n' "${MOCK_BRANCH:-staging}"
+  printf '%s\n' "${MOCK_BRANCH:-main}"
   ;;
 rev-parse)
   case "${2:-}" in
@@ -91,7 +91,7 @@ rev-parse)
   --verify)
     case "${3:-}" in
     'HEAD^{commit}') printf '%s\n' "$MOCK_SHA" ;;
-    'refs/remotes/origin/staging^{commit}') printf '%s\n' "${MOCK_ORIGIN_SHA:-$MOCK_SHA}" ;;
+    'refs/remotes/origin/main^{commit}') printf '%s\n' "${MOCK_ORIGIN_SHA:-$MOCK_SHA}" ;;
     "refs/tags/${MOCK_TAG}^{commit}") printf '%s\n' "$MOCK_SHA" ;;
     *) printf 'unexpected git rev-parse --verify: %s\n' "$*" >&2; exit 2 ;;
     esac
@@ -101,7 +101,7 @@ rev-parse)
   ;;
 branch)
   [ "${2:-}" = '--show-current' ] || exit 2
-  printf '%s\n' "${MOCK_BRANCH:-staging}"
+  printf '%s\n' "${MOCK_BRANCH:-main}"
   ;;
 status)
   [ "${2:-}" = '--porcelain' ] || exit 2
@@ -122,13 +122,13 @@ remote)
 fetch)
   [ "${MOCK_FETCH_FAILURE:-0}" != 1 ] || exit 1
   case "$*" in
-  "fetch --quiet $MOCK_FETCH_URL refs/heads/staging:refs/remotes/origin/staging") ;;
-  "fetch --quiet origin refs/heads/${MOCK_BRANCH:-staging}:refs/remotes/origin/${MOCK_BRANCH:-staging}") ;;
+  "fetch --quiet $MOCK_FETCH_URL refs/heads/main:refs/remotes/origin/main") ;;
+  "fetch --quiet origin refs/heads/${MOCK_BRANCH:-main}:refs/remotes/origin/${MOCK_BRANCH:-main}") ;;
   *) exit 2 ;;
   esac
   ;;
 rev-list)
-  [ "$*" = "rev-list --count HEAD..origin/${MOCK_BRANCH:-staging}" ] || exit 2
+  [ "$*" = "rev-list --count HEAD..origin/${MOCK_BRANCH:-main}" ] || exit 2
   printf '%s\n' "${MOCK_BEHIND_COUNT:-0}"
   ;;
 show-ref)
@@ -293,8 +293,8 @@ test_dry_run_has_no_network_or_mutation()
 
   create_fixture
   output="$(run_make ship SHIP_DRY_RUN=1 2>&1)" || fail "dry-run must succeed: $output"
-  require_contains "$output" '[dry-run] git fetch --quiet <origin-fetch-url> refs/heads/staging:refs/remotes/origin/staging' \
-    'dry-run must print the staging fetch'
+  require_contains "$output" '[dry-run] git fetch --quiet <origin-fetch-url> refs/heads/main:refs/remotes/origin/main' \
+    'dry-run must print the main fetch'
   require_contains "$output" "[dry-run] git -c gpg.format=ssh tag -s -a $TAG $SHA" \
     'dry-run must print the exact signed tag command'
   require_contains "$output" '[dry-run] poll gh run list --workflow publish-fork.yml' \
@@ -328,7 +328,7 @@ test_bare_make_is_inert()
   pass 'bare_make_is_inert'
 }
 
-test_requires_unambiguous_origin_and_exact_staging_tip()
+test_requires_unambiguous_origin_and_exact_main_tip()
 {
   local output calls
 
@@ -370,15 +370,15 @@ test_requires_unambiguous_origin_and_exact_staging_tip()
 
   create_fixture
   if output="$(MOCK_BRANCH=v4.x run_make ship 2>&1)"; then
-    fail 'shipping any branch other than staging must fail'
+    fail 'shipping any branch other than main must fail'
   fi
-  require_contains "$output" 'expected staging' 'release must reject a non-staging branch'
+  require_contains "$output" 'expected main' 'release must reject a non-main branch'
   calls="$(cat "$fixture/git.calls")"
   require_not_contains "$calls" 'fetch ' 'branch guard must run before network access'
 
   create_fixture
   if output="$(MOCK_DIRTY=1 run_make ship 2>&1)"; then
-    fail 'shipping a dirty staging checkout must fail'
+    fail 'shipping a dirty main checkout must fail'
   fi
   require_contains "$output" 'fully committed and clean' 'release must reject a dirty checkout'
   calls="$(cat "$fixture/git.calls")"
@@ -386,15 +386,15 @@ test_requires_unambiguous_origin_and_exact_staging_tip()
 
   create_fixture
   if output="$(MOCK_ORIGIN_SHA="$OTHER_SHA" run_make ship 2>&1)"; then
-    fail 'shipping an ahead or divergent staging checkout must fail'
+    fail 'shipping an ahead or divergent main checkout must fail'
   fi
-  require_contains "$output" 'must exactly equal origin/staging' \
+  require_contains "$output" 'must exactly equal origin/main' \
     'release must require equality, not only zero commits behind'
   calls="$(cat "$fixture/git.calls")"
-  require_contains "$calls" "fetch --quiet $FETCH_URL refs/heads/staging:refs/remotes/origin/staging" \
-    'release must fetch origin/staging through the explicit fetch URL before equality check'
+  require_contains "$calls" "fetch --quiet $FETCH_URL refs/heads/main:refs/remotes/origin/main" \
+    'release must fetch origin/main through the explicit fetch URL before equality check'
   require_not_contains "$calls" 'tag -s -a' 'failed equality guard must not create a tag'
-  pass 'requires_unambiguous_origin_and_exact_staging_tip'
+  pass 'requires_unambiguous_origin_and_exact_main_tip'
 }
 
 test_rejects_spoofed_and_credentialed_https_origin_urls()
@@ -474,13 +474,13 @@ test_branch_guard_fails_closed_and_leaves_exact_equality_to_ship()
   if output="$(MOCK_FETCH_FAILURE=1 run_branch_guard 2>&1)"; then
     fail 'the branch guard must fail when origin fetch fails'
   fi
-  require_contains "$output" 'git fetch origin staging failed' 'fetch failure must be explicit'
+  require_contains "$output" 'git fetch origin main failed' 'fetch failure must be explicit'
 
   create_fixture
   if output="$(MOCK_BEHIND_COUNT=2 run_branch_guard 2>&1)"; then
     fail 'the branch guard must reject a behind checkout'
   fi
-  require_contains "$output" 'is 2 commit(s) behind origin/staging' 'behind refusal must report the count'
+  require_contains "$output" 'is 2 commit(s) behind origin/main' 'behind refusal must report the count'
 
   create_fixture
   if output="$(MOCK_DIRTY=1 run_branch_guard --require-clean 2>&1)"; then
@@ -553,7 +553,7 @@ test_release_flow_binds_tag_verifier_and_publish_run()
   output="$(MOCK_GH_MODE=delayed SHIP_STATUS_DISCOVERY_ATTEMPTS=2 \
     SHIP_STATUS_DISCOVERY_DELAY_SECONDS=0 run_make ship 2>&1)" || fail "release flow must succeed: $output"
   calls="$(cat "$fixture/git.calls")"
-  require_contains "$calls" "fetch --quiet $FETCH_URL refs/heads/staging:refs/remotes/origin/staging" \
+  require_contains "$calls" "fetch --quiet $FETCH_URL refs/heads/main:refs/remotes/origin/main" \
     'release must fetch through the validated explicit fetch URL'
   require_contains "$calls" "-c gpg.format=ssh tag -s -a $TAG $SHA -m Release $TAG" \
     'release must create an annotated signed tag at HEAD'
@@ -727,7 +727,7 @@ test_status_reports_the_newest_exact_run()
 
 test_bare_make_is_inert
 test_dry_run_has_no_network_or_mutation
-test_requires_unambiguous_origin_and_exact_staging_tip
+test_requires_unambiguous_origin_and_exact_main_tip
 test_rejects_spoofed_and_credentialed_https_origin_urls
 test_accepts_canonical_origin_url_forms
 test_branch_guard_fails_closed_and_leaves_exact_equality_to_ship
@@ -738,4 +738,4 @@ test_recreated_tag_requires_a_new_publish_run
 test_post_tag_failures_never_delete_release_identity
 test_missing_publish_run_preserves_tag_and_status_is_read_only
 test_status_reports_the_newest_exact_run
-printf '%s\n' 'ALL STAGING FORK RELEASE SHIP TESTS PASSED'
+printf '%s\n' 'ALL MAIN FORK RELEASE SHIP TESTS PASSED'

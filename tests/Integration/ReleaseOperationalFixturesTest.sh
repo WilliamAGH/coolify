@@ -408,8 +408,8 @@ export GITHUB_EVENT_NAME=repository_dispatch
 export GITHUB_REPOSITORY=williamacallahan/coolify
 export GITHUB_REF_TYPE=branch
 export GITHUB_REF_PROTECTED=true
-export GITHUB_REF=refs/heads/v4.x
-export GITHUB_REF_NAME=v4.x
+export GITHUB_REF=refs/heads/main
+export GITHUB_REF_NAME=main
 export GITHUB_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 export GITHUB_RUN_ID=123
 export GITHUB_RUN_ATTEMPT=1
@@ -419,7 +419,7 @@ cat > "$event_path" <<'JSON'
   "action": "release-operational-acceptance",
   "repository": {
     "full_name": "williamacallahan/coolify",
-    "default_branch": "v4.x"
+    "default_branch": "main"
   }
 }
 JSON
@@ -436,14 +436,14 @@ fi
 assert_no_mutation 'unprotected repository_dispatch reached a regctl mutation'
 export GITHUB_REF_PROTECTED=true
 
-export GITHUB_REF=refs/heads/not-v4.x
-export GITHUB_REF_NAME=not-v4.x
+export GITHUB_REF=refs/heads/not-main
+export GITHUB_REF_NAME=not-main
 if "$helper" seed issue7 staging-predecessor >/dev/null 2>&1; then
     fail 'non-default protected branch seeded a registry fixture'
 fi
 assert_no_mutation 'non-default protected branch reached a regctl mutation'
-export GITHUB_REF=refs/heads/v4.x
-export GITHUB_REF_NAME=v4.x
+export GITHUB_REF=refs/heads/main
+export GITHUB_REF_NAME=main
 
 export GITHUB_RUN_ID='123/unsafe'
 if "$helper" seed issue7 staging-predecessor >/dev/null 2>&1; then

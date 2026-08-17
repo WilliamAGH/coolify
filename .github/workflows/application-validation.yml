@@ -42,11 +42,22 @@ jobs:
       - name: Bind requested source to check-run revision
         shell: bash
         env:
+          BASE_REF: ${{ github.base_ref }}
           CHECK_RUN_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
           VALIDATION_SOURCE_SHA: ${{ inputs.source_sha }}
           VALIDATION_BASE_SHA: ${{ inputs.base_sha }}
         run: |
           set -Eeuo pipefail
+          if [[ "$EVENT_NAME" == 'pull_request' && "$REPOSITORY" == 'williamacallahan/coolify' && "$BASE_REF" == 'main' ]]; then
+            [[ "$HEAD_REF" == 'dev' && "$HEAD_REPOSITORY" == "$REPOSITORY" ]] || {
+              echo 'Only a same-repository dev branch may be promoted to main.' >&2
+              exit 1
+            }
+          fi
           if [[ -z "$VALIDATION_SOURCE_SHA" ]]; then
             exit 0
           fi
@@ -57,9 +68,9 @@ jobs:
           if [[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]; then
             exit 0
           fi
-          # Gate shape: a reusable-workflow caller (the v4.x candidate gate)
-          # validates a candidate that descends from the frozen base this run
-          # executes on. github.event_name stays the caller's trigger, so the
+          # Gate shape: a reusable-workflow caller validates a candidate that
+          # descends from the frozen base this run executes on.
+          # github.event_name stays the caller's trigger, so the
           # shape is recognized by the frozen base input instead. The caller
           # binds the exact candidate ref to the requested SHA and attests
           # the check to it; the binding here proves the run executes on the

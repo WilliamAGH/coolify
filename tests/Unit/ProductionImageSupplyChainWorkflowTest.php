@@ -1618,7 +1618,9 @@ it('uses the trusted fork promotion runner while keeping pull-request validation
     }
 
     expect($pullRequestQualityWorkflow['jobs']['pr-quality']['runs-on'] ?? null)
-        ->toBe('ubuntu-latest', 'pull-request quality job must stay GitHub-hosted');
+        ->toBe('ubuntu-latest', 'pull-request quality job must stay GitHub-hosted')
+        ->and($pullRequestQualityWorkflow['jobs']['pr-quality']['steps'][0]['with']['allowed-target-branches'] ?? null)
+        ->toBe("\${{ github.repository == 'williamacallahan/coolify' && 'main' || 'next' }}");
 });
 
 it('rejects fork publication graphs that bypass the exact control-plane image census', function (string $mutation) {
@@ -3552,7 +3554,7 @@ it('fails when a fork alias moves during signed release publication', function (
     }
 });
 
-it('requires the fork tag commit to be reachable from the trusted staging branch before publication', function () {
+it('requires the fork tag commit to be reachable from the trusted main branch before publication', function () {
     $caller = Yaml::parseFile(releaseWorkflowRepositoryRoot().'/.github/workflows/publish-fork.yml');
     $resolveTag = $caller['jobs']['resolve-tag'] ?? [];
     $resolveTagRun = (string) (releaseWorkflowStepById($resolveTag, 'version')['run'] ?? '');
@@ -3560,8 +3562,8 @@ it('requires the fork tag commit to be reachable from the trusted staging branch
     expect($resolveTag)->not->toHaveKey('needs')
         ->and($caller['jobs']['application-validation']['needs'] ?? null)->toBe('resolve-tag')
         ->and($resolveTagRun)
-        ->toContain("git fetch --no-tags origin '+refs/heads/staging:refs/remotes/origin/staging'")
-        ->toContain("git rev-parse --verify 'refs/remotes/origin/staging^{commit}'")
+        ->toContain("git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'")
+        ->toContain("git rev-parse --verify 'refs/remotes/origin/main^{commit}'")
         ->toContain('git merge-base --is-ancestor "$SOURCE_REVISION" "$trusted_release_branch"');
 });
 

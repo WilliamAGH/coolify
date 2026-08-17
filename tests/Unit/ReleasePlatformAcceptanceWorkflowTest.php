@@ -161,7 +161,7 @@ it('accepts a safe staging-only alias and publishes it through the serialized re
                 'DOCKERHUB_USERNAME' => 'fixture-user',
                 'GITHUB_OUTPUT' => $githubOutput,
                 'GITHUB_EVENT_NAME' => 'workflow_call',
-                'GITHUB_REF' => 'refs/heads/v4.x',
+                'GITHUB_REF' => 'refs/heads/main',
                 'GITHUB_REF_PROTECTED' => 'true',
                 'GITHUB_RUN_ATTEMPT' => '1',
                 'GITHUB_RUN_ID' => '1',
