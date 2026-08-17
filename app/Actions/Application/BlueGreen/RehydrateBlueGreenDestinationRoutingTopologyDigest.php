@@ -19,9 +19,11 @@ use Throwable;
 /**
  * Establishes the DB-only routing topology fence for legacy destination state.
  *
- * The IDLE path is operator-invoked and remotely attested. Active operation
- * recovery instead proves the frozen claim against current topology without
- * mutating the destination host. Only a proven NULL database value is filled.
+ * Passive IDLE rehydration is operator-invoked. An exact inactive-retirement
+ * owner may invoke the same remote attestation under its lifecycle fence.
+ * Active operation recovery instead proves the frozen claim against current
+ * topology without mutating the destination host. Only a proven NULL database
+ * value is filled.
  */
 final class RehydrateBlueGreenDestinationRoutingTopologyDigest
 {
@@ -153,6 +155,13 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
         ?string $inactiveRetirementOwnerDeploymentUuid = null,
         ?int $inactiveRetirementSupersessionGeneration = null,
     ): ApplicationBlueGreenDeployment {
+        if ($inactiveRetirementOwnerDeploymentUuid === null
+            && $inactiveRetirementSupersessionGeneration === null
+            && is_string($candidate->inactive_retirement_owner_deployment_uuid)
+            && is_int($candidate->inactive_retirement_supersession_generation)) {
+            $inactiveRetirementOwnerDeploymentUuid = $candidate->inactive_retirement_owner_deployment_uuid;
+            $inactiveRetirementSupersessionGeneration = $candidate->inactive_retirement_supersession_generation;
+        }
         if (($inactiveRetirementOwnerDeploymentUuid === null) !== ($inactiveRetirementSupersessionGeneration === null)) {
             throw new BlueGreenDeploymentTransitionException('Routing topology rehydration requires one exact inactive-retirement owner and generation.');
         }
@@ -163,18 +172,13 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             $inactiveRetirementOwnerDeploymentUuid,
             $inactiveRetirementSupersessionGeneration,
         );
-        if ($context['state']->destination_routing_topology_digest !== null) {
+        if ($context['state']->destination_routing_topology_digest !== null
+            && $inactiveRetirementOwnerDeploymentUuid === null) {
             return $context['state'];
         }
         $server = $context['destination']->server
             ?? throw new BlueGreenDeploymentTransitionException('The legacy destination has no exact server.');
-        $expectedBootId = $inactiveRetirementOwnerDeploymentUuid === null
-            ? null
-            : $context['state']->inactive_retirement_server_boot_id;
-        $bootId = ReadBlueGreenServerBootIdentity::run(
-            $server,
-            is_string($expectedBootId) ? $expectedBootId : null,
-        );
+        $bootId = ReadBlueGreenServerBootIdentity::run($server);
         $fence->assertLockOwnership();
         $liveState = ReadBlueGreenManagedRouteMetadata::run(
             $server,
@@ -194,6 +198,10 @@ final class RehydrateBlueGreenDestinationRoutingTopologyDigest
             containerIdentityState: $context['expectedState'],
         );
         $fence->assertLockOwnership();
+
+        if ($context['state']->destination_routing_topology_digest !== null) {
+            return $context['state'];
+        }
 
         return $this->commit(
             $context,

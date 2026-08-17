@@ -17,6 +17,7 @@ use App\Actions\Application\BlueGreen\InspectBlueGreenContainer;
 use App\Actions\Application\BlueGreen\PlanBlueGreenSteadyState;
 use App\Actions\Application\BlueGreen\PrepareBlueGreenDeactivation;
 use App\Actions\Application\BlueGreen\RecoverBlueGreenIntervention;
+use App\Actions\Application\BlueGreen\RehydrateBlueGreenDestinationRoutingTopologyDigest;
 use App\Actions\Application\BlueGreen\ResolveBlueGreenExpectedProxyState;
 use App\Actions\Application\BlueGreen\ResumeBlueGreenInactiveRetirements;
 use App\Actions\Application\BlueGreen\RetireBlueGreenInactiveContainer;
@@ -32,6 +33,7 @@ use App\Enums\BlueGreenDeploymentPhase;
 use App\Enums\ContainerStatusTypes;
 use App\Enums\ProxyTypes;
 use App\Exceptions\BlueGreenRecoveryHandoffException;
+use App\Exceptions\DeploymentException;
 use App\Jobs\ApplicationDeploymentJob;
 use App\Jobs\RetireBlueGreenInactiveContainerJob;
 use App\Livewire\Project\Application\Advanced;
@@ -1641,6 +1643,35 @@ function isInactiveReplicaSlotProofPayload(string $payload): bool
             || str_contains($payload, '! docker container inspect'));
 }
 
+/** @return Closure(string): ?FakeProcessResult */
+function blueGreenInactiveRetirementProofResponder(
+    string $publicAcknowledgement,
+    string $releaseProof,
+    string $destinationNetwork,
+): Closure {
+    return static function (string $payload) use ($destinationNetwork, $publicAcknowledgement, $releaseProof): ?FakeProcessResult {
+        if (str_contains($payload, 'coolify-blue-green-route-network-proof:')) {
+            preg_match('/coolify-blue-green-route-network-proof:([a-f0-9]{64})/', $payload, $matches);
+
+            return Process::result(output: 'coolify-blue-green-route-network-proof:'
+                .($matches[1] ?? throw new RuntimeException('The network proof fixture did not receive an exact Docker identity.'))."\t"
+                .json_encode([$destinationNetwork => []], JSON_THROW_ON_ERROR));
+        }
+        if (str_contains($payload, VerifyBlueGreenCandidateReleaseProof::LABEL)) {
+            return Process::result(output: json_encode([
+                VerifyBlueGreenCandidateReleaseProof::ENVIRONMENT_VARIABLE.'='.$releaseProof,
+            ], JSON_THROW_ON_ERROR));
+        }
+        if (str_contains($payload, 'curl --config -')) {
+            return Process::result(output: "HTTP/1.1 200 OK\r\n"
+                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$publicAcknowledgement}\r\n"
+                .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n");
+        }
+
+        return null;
+    };
+}
+
 /**
  * @param  list<string>  $payloads
  * @param  (Closure(string): FakeProcessResult)|null  $onReplicaSlotProof
@@ -1767,6 +1798,7 @@ function fakeCommittedInactiveRetirementJournalRemote(
 /**
  * @param  list<string>  $payloads
  * @param  (Closure(string): FakeProcessResult)|null  $onReplicaSlotProof
+ * @param  (Closure(string): ?FakeProcessResult)|null  $proofResponder
  */
 function fakeAbsentExpectedSidecarInactiveRetirementRemote(
     array &$payloads,
@@ -1774,11 +1806,14 @@ function fakeAbsentExpectedSidecarInactiveRetirementRemote(
     BlueGreenProxyState $expectedState,
     string $bootId,
     ?Closure $onReplicaSlotProof = null,
+    ?Closure $proofResponder = null,
+    ?BlueGreenProxyState $reportedState = null,
 ): void {
     $payloads = [];
     $strictManagedRouteRead = false;
     $managedSha256 = $expectedState->managedSha256
         ?? throw new RuntimeException('The journal-free retirement fixture requires a present expected route.');
+    $reportedState ??= $expectedState;
     Process::fake(function (PendingProcess $process) use (
         &$payloads,
         &$strictManagedRouteRead,
@@ -1786,12 +1821,18 @@ function fakeAbsentExpectedSidecarInactiveRetirementRemote(
         $expectedState,
         $managedSha256,
         $onReplicaSlotProof,
+        $proofResponder,
+        $reportedState,
     ): FakeProcessResult {
         $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
             ."\n".(string) $process->input;
         $payloads[] = $payload;
         if ($onReplicaSlotProof !== null && isInactiveReplicaSlotProofPayload($payload)) {
             return $onReplicaSlotProof($payload);
+        }
+        $proofResult = $proofResponder?->__invoke($payload);
+        if ($proofResult instanceof FakeProcessResult) {
+            return $proofResult;
         }
         if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
             return Process::result(output: $bootId);
@@ -1805,10 +1846,17 @@ function fakeAbsentExpectedSidecarInactiveRetirementRemote(
             $strictManagedRouteRead = true;
 
             return Process::result(output: 'coolify-blue-green-managed-route:present:'
-                .base64_encode($expectedState->serialize())
+                .base64_encode($reportedState->serialize())
                 ."\n".$managedSha256);
         }
         if (str_contains($payload, 'coolify-blue-green-destination-state-attested')) {
+            if (! str_contains($payload, base64_encode($expectedState->serialize()))) {
+                return Process::result(
+                    errorOutput: 'The destination-state fixture received a foreign serialized route.',
+                    exitCode: 1,
+                );
+            }
+
             return Process::result(output: 'coolify-blue-green-destination-state-attested');
         }
         if (str_contains($payload, "docker ps -a --filter='label=coolify.applicationId=")) {
@@ -1825,6 +1873,7 @@ function fakeAbsentExpectedSidecarInactiveRetirementRemote(
 
 /**
  * @param  list<string>  $payloads
+ * @param  (Closure(string): ?FakeProcessResult)|null  $proofResponder
  */
 function fakePendingExpectedSidecarInactiveRetirementRemote(
     array &$payloads,
@@ -1836,9 +1885,7 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
     string $bootId,
     ?string $journalBootId = null,
     int|string $connections = 0,
-    ?string $publicAcknowledgement = null,
-    ?string $releaseProof = null,
-    ?string $destinationNetwork = null,
+    ?Closure $proofResponder = null,
 ): void {
     $payloads = [];
     $archiveRequested = false;
@@ -1864,12 +1911,10 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
         $journalBootId,
         &$journalScriptsReplayed,
         &$payloads,
-        $publicAcknowledgement,
-        $releaseProof,
+        $proofResponder,
         &$replacementFinalized,
         $replacementManagedSha256,
         $replacementState,
-        $destinationNetwork,
     ): FakeProcessResult {
         $payload = (is_array($process->command) ? implode(' ', $process->command) : (string) $process->command)
             ."\n".(string) $process->input;
@@ -1880,25 +1925,12 @@ function fakePendingExpectedSidecarInactiveRetirementRemote(
             || str_contains($payload, 'sh "$operation_container_completion_decoded"')) {
             $journalScriptsReplayed = true;
         }
-        if ($destinationNetwork !== null && str_contains($payload, 'coolify-blue-green-route-network-proof:')) {
-            preg_match('/coolify-blue-green-route-network-proof:([a-f0-9]{64})/', $payload, $matches);
-
-            return Process::result(output: 'coolify-blue-green-route-network-proof:'
-                .($matches[1] ?? throw new RuntimeException('The network proof fixture did not receive an exact Docker identity.'))."\t"
-                .json_encode([$destinationNetwork => []], JSON_THROW_ON_ERROR));
+        $proofResult = $proofResponder?->__invoke($payload);
+        if ($proofResult instanceof FakeProcessResult) {
+            return $proofResult;
         }
         if (str_contains($payload, "tr -d '\\n' < /proc/sys/kernel/random/boot_id")) {
             return Process::result(output: $bootId);
-        }
-        if ($releaseProof !== null && str_contains($payload, VerifyBlueGreenCandidateReleaseProof::LABEL)) {
-            return Process::result(output: json_encode([
-                VerifyBlueGreenCandidateReleaseProof::ENVIRONMENT_VARIABLE.'='.$releaseProof,
-            ], JSON_THROW_ON_ERROR));
-        }
-        if ($publicAcknowledgement !== null && $releaseProof !== null && str_contains($payload, 'curl --config -')) {
-            return Process::result(output: "HTTP/1.1 200 OK\r\n"
-                .BlueGreenRoutingTarget::PROBE_ACKNOWLEDGEMENT_HEADER.": {$publicAcknowledgement}\r\n"
-                .BlueGreenRoutingTarget::RELEASE_PROOF_HEADER.": {$releaseProof}\r\n\r\n");
         }
         if (str_contains($payload, WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX)) {
             $archiveRequested = true;
@@ -3530,9 +3562,11 @@ it('converges a retirement whose rehydration is fenced by its own pending drain 
         $expectedState,
         $replacementState,
         $state->inactive_retirement_server_boot_id,
-        publicAcknowledgement: $steadyStatePlan->publicAcknowledgement,
-        releaseProof: $releaseProof,
-        destinationNetwork: $application->destination->network,
+        proofResponder: blueGreenInactiveRetirementProofResponder(
+            $steadyStatePlan->publicAcknowledgement,
+            $releaseProof,
+            $application->destination->network,
+        ),
     );
     InspectBlueGreenContainer::shouldRun()
         ->andReturnUsing(static fn (Server $server, BlueGreenContainerExpectation $expectation): BlueGreenContainerInspection => $expectation->dockerId === null
@@ -3578,6 +3612,230 @@ it('converges a retirement whose rehydration is fenced by its own pending drain 
         ->and($claimedState->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($claimedState->inactive_retirement_owner_deployment_uuid)->toBeNull();
 });
+
+it('converges a rebooted journal-free inactive retirement with null observations before a successor deployment claims the destination', function (): void {
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $currentBootId = '22222222-3333-4444-5555-666666666666';
+    $state->update([
+        'destination_routing_topology_digest' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => now()->addMinute(),
+        'inactive_retirement_last_observed_connections' => null,
+        'inactive_retirement_observed_at' => null,
+    ]);
+    $state = $state->fresh();
+    $successor = makeBlueGreenInactiveRetirementDeployment($application);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The rebooted journal-free fixture requires an exact expected route state.');
+    $steadyStatePlan = PlanBlueGreenSteadyState::run(
+        $application,
+        $application->destination,
+        $state,
+    );
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        (string) $expectedState->activeDeploymentUuid,
+    );
+    $expectedRoutingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+        $application,
+        $application->destination,
+    );
+    $inactiveContainerId = $state->inactive_retirement_container_id;
+    $payloads = [];
+    $strictManagedRouteRead = false;
+    fakeAbsentExpectedSidecarInactiveRetirementRemote(
+        $payloads,
+        $strictManagedRouteRead,
+        $expectedState,
+        $currentBootId,
+        proofResponder: blueGreenInactiveRetirementProofResponder(
+            $steadyStatePlan->publicAcknowledgement,
+            $releaseProof,
+            $application->destination->network,
+        ),
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->andReturnUsing(static function (Server $server, BlueGreenContainerExpectation $expectation) use ($expectedState, $inactiveContainerId): BlueGreenContainerInspection {
+            if ($expectation->dockerId === $inactiveContainerId) {
+                return BlueGreenContainerInspection::missing();
+            }
+            if ($expectation->name === $expectedState->activeContainerName
+                || $expectation->dockerId === $expectedState->activeContainerId) {
+                return new BlueGreenContainerInspection(
+                    exists: true,
+                    dockerId: $expectedState->activeContainerId,
+                    status: ContainerStatusTypes::RUNNING->value,
+                    health: 'healthy',
+                );
+            }
+
+            return BlueGreenContainerInspection::missing();
+        });
+    $lifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $successor);
+
+    expect($state->inactive_retirement_last_observed_connections)->toBeNull()
+        ->and($state->inactive_retirement_observed_at)->toBeNull();
+    $lifecycle->initialize();
+
+    $recoveredState = $state->fresh();
+    expect($strictManagedRouteRead)->toBeTrue()
+        ->and($recoveredState->destination_routing_topology_digest)->toBe($expectedRoutingTopologyDigest)
+        ->and($recoveredState->inactive_retirement_stopped_at)->not->toBeNull()
+        ->and($recoveredState->inactive_retirement_intervention_required_at)->toBeNull()
+        ->and($recoveredState->inactive_retirement_dispatch_reserved_until_at)->toBeNull()
+        ->and($recoveredState->inactive_retirement_last_observed_connections)->toBe(0)
+        ->and($recoveredState->inactive_retirement_observed_at)->not->toBeNull()
+        ->and($recoveredState->destination_fence_operation_id)->toBe($expectedState->operationId)
+        ->and($recoveredState->destination_fence_mutation_sequence)->toBe($expectedState->mutationSequence)
+        ->and(ClaimBlueGreenDeployment::stateIsCleanlyClaimable($recoveredState))->toBeTrue()
+        ->and((string) $owner->fresh()->logs)->toContain('was already absent after reboot; exact retirement completion was recovered')
+        ->and(implode("\n", $payloads))->not->toContain(
+            WriteBlueGreenProxyConfiguration::CONTAINER_MUTATION_JOURNAL_CAS_OUTPUT_PREFIX,
+            'container_journal_stage=',
+            'operation_container_state_stage=',
+        );
+
+    $claim = $lifecycle->claim();
+    $claimedState = $state->fresh();
+    expect($claim->deploymentUuid)->toBe($successor->deployment_uuid)
+        ->and($claimedState->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
+        ->and($claimedState->inactive_retirement_owner_deployment_uuid)->toBeNull();
+});
+
+it('rehydrates a rebooted inactive retirement using its exact durable owner and generation', function (): void {
+    ['application' => $application, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $currentBootId = '22222222-3333-4444-5555-666666666666';
+    $state->update(['destination_routing_topology_digest' => null]);
+    $state = $state->fresh();
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The rebooted rehydration fixture requires an exact expected route state.');
+    $steadyStatePlan = PlanBlueGreenSteadyState::run(
+        $application,
+        $application->destination,
+        $state,
+    );
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        (string) $expectedState->activeDeploymentUuid,
+    );
+    $expectedRoutingTopologyDigest = (new ComputeBlueGreenDeploymentFingerprint)->routingTopologyDigestFor(
+        $application,
+        $application->destination,
+    );
+    $payloads = [];
+    $strictManagedRouteRead = false;
+    fakeAbsentExpectedSidecarInactiveRetirementRemote(
+        $payloads,
+        $strictManagedRouteRead,
+        $expectedState,
+        $currentBootId,
+        proofResponder: blueGreenInactiveRetirementProofResponder(
+            $steadyStatePlan->publicAcknowledgement,
+            $releaseProof,
+            $application->destination->network,
+        ),
+    );
+    InspectBlueGreenContainer::shouldRun()->andReturn(new BlueGreenContainerInspection(
+        exists: true,
+        dockerId: $expectedState->activeContainerId,
+        status: ContainerStatusTypes::RUNNING->value,
+        health: 'healthy',
+    ));
+
+    $rehydrated = RehydrateBlueGreenDestinationRoutingTopologyDigest::run($state);
+
+    expect($strictManagedRouteRead)->toBeTrue()
+        ->and($rehydrated->destination_routing_topology_digest)->toBe($expectedRoutingTopologyDigest)
+        ->and($rehydrated->inactive_retirement_owner_deployment_uuid)->toBe($state->inactive_retirement_owner_deployment_uuid)
+        ->and($rehydrated->inactive_retirement_supersession_generation)->toBe($state->inactive_retirement_supersession_generation);
+});
+
+it('keeps rebooted journal-free retirement recovery fenced unless every live proof is exact', function (string $failure): void {
+    ['application' => $application, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    prepareBlueGreenInactiveRetirementRemote($application->destination->server);
+    $currentBootId = '22222222-3333-4444-5555-666666666666';
+    $state->update([
+        'destination_routing_topology_digest' => null,
+        'inactive_retirement_dispatch_reserved_until_at' => now()->addMinute(),
+        'inactive_retirement_last_observed_connections' => null,
+        'inactive_retirement_observed_at' => null,
+    ]);
+    $state = $state->fresh();
+    $successor = makeBlueGreenInactiveRetirementDeployment($application);
+    $expectedState = ResolveBlueGreenExpectedProxyState::run(
+        $application,
+        $application->destination,
+        $state,
+    ) ?? throw new RuntimeException('The rejected rebooted journal-free fixture requires an exact expected route state.');
+    $steadyStatePlan = PlanBlueGreenSteadyState::run(
+        $application,
+        $application->destination,
+        $state,
+    );
+    $releaseProof = BlueGreenRoutingTarget::durableReleaseProofToken(
+        (string) $expectedState->activeDeploymentUuid,
+    );
+    $inactiveContainerId = $state->inactive_retirement_container_id;
+    $payloads = [];
+    $strictManagedRouteRead = false;
+    fakeAbsentExpectedSidecarInactiveRetirementRemote(
+        $payloads,
+        $strictManagedRouteRead,
+        $expectedState,
+        $currentBootId,
+        proofResponder: blueGreenInactiveRetirementProofResponder(
+            $steadyStatePlan->publicAcknowledgement,
+            $releaseProof,
+            $application->destination->network,
+        ),
+        reportedState: $failure === 'route mismatch'
+            ? $expectedState->withMutationOwner('foreign-rebooted-retirement-owner')
+            : null,
+    );
+    InspectBlueGreenContainer::shouldRun()
+        ->andReturnUsing(static function (Server $server, BlueGreenContainerExpectation $expectation) use ($expectedState, $failure, $inactiveContainerId): BlueGreenContainerInspection {
+            if ($expectation->dockerId === $inactiveContainerId) {
+                return $failure === 'inactive target exists'
+                    ? new BlueGreenContainerInspection(
+                        exists: true,
+                        dockerId: $inactiveContainerId,
+                        status: ContainerStatusTypes::RUNNING->value,
+                        health: 'healthy',
+                    )
+                    : BlueGreenContainerInspection::missing();
+            }
+            if ($expectation->name === $expectedState->activeContainerName
+                || $expectation->dockerId === $expectedState->activeContainerId) {
+                return new BlueGreenContainerInspection(
+                    exists: true,
+                    dockerId: $failure === 'active container mismatch'
+                        ? str_repeat('d', 64)
+                        : $expectedState->activeContainerId,
+                    status: ContainerStatusTypes::RUNNING->value,
+                    health: 'healthy',
+                );
+            }
+
+            return BlueGreenContainerInspection::missing();
+        });
+    $lifecycle = makeBlueGreenInactiveRetirementLifecycle($application, $successor);
+
+    expect(fn () => $lifecycle->initialize())->toThrow(DeploymentException::class);
+
+    $rejectedState = $state->fresh();
+    expect($rejectedState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($rejectedState->inactive_retirement_intervention_required_at)->not->toBeNull()
+        ->and($successor->fresh()->blue_green_phase)->toBeNull();
+})->with([
+    'live route mismatch' => 'route mismatch',
+    'active container mismatch' => 'active container mismatch',
+    'inactive target still exists' => 'inactive target exists',
+]);
 
 it('completes an owner-exact stopped legacy retirement without rehydrating its null topology digest', function (): void {
     ['owner' => $owner, 'state' => $state] = makeReadyBlueGreenInactiveRetirement();
@@ -3773,9 +4031,11 @@ it('reports raw pending-journal rehydration failures without disclosing privileg
         $expectedState,
         $replacementState,
         $state->inactive_retirement_server_boot_id,
-        publicAcknowledgement: $steadyStatePlan->publicAcknowledgement,
-        releaseProof: $releaseProof,
-        destinationNetwork: $application->destination->network,
+        proofResponder: blueGreenInactiveRetirementProofResponder(
+            $steadyStatePlan->publicAcknowledgement,
+            $releaseProof,
+            $application->destination->network,
+        ),
     );
     $marker = 'ssh: root@10.66.0.99 PRIVILEGED-INACTIVE-RETIREMENT-REHYDRATION-STDERR-MARKER docker inspect permission denied';
     Exceptions::fake();

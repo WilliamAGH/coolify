@@ -90,21 +90,32 @@ final class RetireBlueGreenInactiveContainer
             if ($snapshot->destination_routing_topology_digest === null) {
                 $rehydrator = new RehydrateBlueGreenDestinationRoutingTopologyDigest;
                 if ($snapshot->inactive_retirement_intervention_required_at !== null) {
-                    $this->rehydratePendingJournal(
-                        $rehydrator,
-                        $snapshot,
-                        $operationFence,
-                        $ownerDeploymentUuid,
-                        $supersessionGeneration,
-                    );
+                    $currentBootId = ReadBlueGreenServerBootIdentity::run($leaseDestination->server);
                     $operationFence->assertLockOwnership();
+                    if (is_string($snapshot->inactive_retirement_server_boot_id)
+                        && hash_equals($snapshot->inactive_retirement_server_boot_id, $currentBootId)) {
+                        try {
+                            $this->rehydratePendingJournal(
+                                $rehydrator,
+                                $snapshot,
+                                $operationFence,
+                                $ownerDeploymentUuid,
+                                $supersessionGeneration,
+                            );
+                            $operationFence->assertLockOwnership();
 
-                    return $this->recoverInterruptedRetirement(
-                        $stateId,
-                        $ownerDeploymentUuid,
-                        $supersessionGeneration,
-                        $operationFence,
-                    ) ?? self::RETRY;
+                            return $this->recoverInterruptedRetirement(
+                                $stateId,
+                                $ownerDeploymentUuid,
+                                $supersessionGeneration,
+                                $operationFence,
+                            ) ?? self::RETRY;
+                        } catch (BlueGreenDeploymentTransitionException $exception) {
+                            if ($exception->getMessage() !== 'The inactive-retirement journal is not the exact pending sidecar for its durable boot provenance.') {
+                                throw $exception;
+                            }
+                        }
+                    }
                 }
                 try {
                     $rehydrator->handleUnderFence(
@@ -1064,7 +1075,43 @@ final class RetireBlueGreenInactiveContainer
 
         if ($inspection->isAbsent()) {
             if ($recoveringAcrossBoot) {
-                throw new BlueGreenDeploymentTransitionException('The rebooted inactive retirement has no exact authenticated container-mutation journal.');
+                (new RehydrateBlueGreenDestinationRoutingTopologyDigest)->handleUnderFence(
+                    $context['state'],
+                    $operationFence,
+                    $ownerDeploymentUuid,
+                    $generation,
+                );
+                $operationFence->assertLockOwnership();
+                $inactiveTargetExists = array_any(
+                    $context['inactive_targets'],
+                    fn (array $target): bool => $this->inspectInactiveRetirementTarget(
+                        $context['server'],
+                        $target,
+                        $context['replica_set'],
+                    )->exists,
+                );
+                if ($inactiveTargetExists) {
+                    throw new BlueGreenDeploymentTransitionException('A rebooted journal-free inactive-retirement target still exists.');
+                }
+                $operationFence->assertLockOwnership();
+                $this->assertRetirementBootIdentity($context['server'], $currentBootId);
+                $this->assertRetirementOwnership(
+                    $operationFence,
+                    $stateId,
+                    $ownerDeploymentUuid,
+                    $generation,
+                );
+                $this->markStopped(
+                    $context['state'],
+                    $context['owner'],
+                    $context['expected_state'],
+                    null,
+                    clearRecoveryBaggage: true,
+                    replicaRows: $context['replica_rows'],
+                    completionLogMessage: "Inactive {$context['state']->inactive_retirement_color->value} target {$context['state']->inactive_retirement_container_id} was already absent after reboot; exact retirement completion was recovered.",
+                );
+
+                return self::COMPLETED;
             }
             if (BlueGreenProxyState::matches($inspection->state, $context['expected_state'])) {
                 if ($context['state']->inactive_retirement_intervention_required_at === null) {
@@ -2648,6 +2695,7 @@ final class RetireBlueGreenInactiveContainer
         bool $clearRecoveryBaggage = false,
         bool $removed = false,
         array $replicaRows = [],
+        ?string $completionLogMessage = null,
     ): void {
         $observedAt = now();
         $updates = [
@@ -2709,9 +2757,9 @@ final class RetireBlueGreenInactiveContainer
             }
         }, attempts: 5);
 
-        $owner->addLogEntry($removed
+        $owner->addLogEntry($completionLogMessage ?? ($removed
             ? "Inactive {$state->inactive_retirement_color->value} target {$state->inactive_retirement_container_id} was removed after the bounded retirement limit."
-            : "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} was stopped and retained for fast rollback.");
+            : "Inactive {$state->inactive_retirement_color->value} container {$state->inactive_retirement_container_id} was stopped and retained for fast rollback."));
     }
 
     private function attestDestinationState(Server $server, BlueGreenProxyState $state): bool|string
