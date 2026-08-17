@@ -56,7 +56,7 @@ it('builds Git LFS from pinned upstream Go source instead of an Alpine package',
     $dockerfile = (string) file_get_contents($root.'/docker/production/Dockerfile');
 
     expect($dockerfile)
-        ->toMatch('/^ARG GO_BUILD_IMAGE=golang:1\\.26\\.5-alpine@sha256:[a-f0-9]{64}$/m')
+        ->toMatch('/^ARG GO_BUILD_IMAGE=golang:1\\.26\\.6-alpine@sha256:[a-f0-9]{64}$/m')
         ->toContain('ARG GIT_LFS_VERSION=3.7.1')
         ->toContain('ARG GIT_LFS_TAG=v3.7.1')
         ->toMatch('/^ARG GIT_LFS_COMMIT=[a-f0-9]{40}$/m')
@@ -68,7 +68,7 @@ it('builds Git LFS from pinned upstream Go source instead of an Alpine package',
         ->toContain('go get "golang.org/x/net@${GIT_LFS_X_NET_VERSION}" "golang.org/x/text@${GIT_LFS_X_TEXT_VERSION}"')
         ->toContain('$2 == "golang.org/x/text" && $3 == expected')
         ->toContain('go mod verify')
-        ->toContain('test "$(go env GOVERSION)" = \'go1.26.5\'')
+        ->toContain('test "$(go env GOVERSION)" = \'go1.26.6\'')
         ->toContain('go version -m /out/git-lfs')
         ->toContain('COPY --from=git-lfs-builder --chmod=755 /out/git-lfs /usr/local/bin/git-lfs')
         ->not->toContain('/alpine/edge/')

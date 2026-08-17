@@ -2,7 +2,7 @@
 
 # Pinned upstream build and runtime inputs. The companion provenance verifier
 # proves these official tags resolve to these commits before CI builds an image.
-ARG GO_BUILDER_IMAGE=golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2
+ARG GO_BUILDER_IMAGE=golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83
 ARG TESTING_HOST_BASE_IMAGE=alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 ARG BASH_VERSION=5.3.9-r1
 

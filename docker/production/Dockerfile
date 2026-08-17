@@ -6,7 +6,7 @@ ARG SERVERSIDEUP_PHP_VERSION=8.5-fpm-nginx-alpine@sha256:638a31d2201022b61605fd4
 # https://hub.docker.com/_/node
 ARG NODE_VERSION=24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd
 # https://hub.docker.com/_/golang
-ARG GO_BUILD_IMAGE=golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2
+ARG GO_BUILD_IMAGE=golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83
 # https://github.com/git-lfs/git-lfs/releases/tag/v3.7.1
 ARG GIT_LFS_VERSION=3.7.1
 ARG GIT_LFS_TAG=v3.7.1
@@ -158,7 +158,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go mod verify && \
     go mod vendor && \
     echo "${CLOUDFLARED_VENDOR_MODULES_SHA256}  vendor/modules.txt" | sha256sum -c - && \
-    test "$(go env GOVERSION)" = 'go1.26.5'
+    test "$(go env GOVERSION)" = 'go1.26.6'
 
 # Cloudflare's Makefile builds with GOOS/GOARCH, -mod=vendor, and these version fields.
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -210,7 +210,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     echo "${GIT_LFS_GO_SUM_SHA256}  go.sum" | sha256sum -c - && \
     go mod download && \
     go mod verify && \
-    test "$(go env GOVERSION)" = 'go1.26.5' && \
+    test "$(go env GOVERSION)" = 'go1.26.6' && \
     test "$(awk '$1 == "golang.org/x/net" { print $2 }' go.mod)" = "${GIT_LFS_X_NET_VERSION}" && \
     test "$(awk '$1 == "golang.org/x/text" { print $2 }' go.mod)" = "${GIT_LFS_X_TEXT_VERSION}" && \
     GOOS=linux \
@@ -224,7 +224,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -o /out/git-lfs \
         ./git-lfs.go
 
-RUN /out/git-lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$" && \
+RUN /out/git-lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.6; git ${GIT_LFS_COMMIT}\\)$" && \
     go version -m /out/git-lfs | awk -v expected="${GIT_LFS_X_NET_VERSION}" '$1 == "dep" && $2 == "golang.org/x/net" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }' && \
     go version -m /out/git-lfs | awk -v expected="${GIT_LFS_X_TEXT_VERSION}" '$1 == "dep" && $2 == "golang.org/x/text" && $3 == expected { found = 1 } END { exit found ? 0 : 1 }'
 
@@ -299,7 +299,7 @@ COPY --from=cloudflared-builder --chmod=755 /out/cloudflared /usr/local/bin/clou
 
 RUN test "$(command -v git-lfs)" = /usr/local/bin/git-lfs && \
     ! apk info -e git-lfs >/dev/null 2>&1 && \
-    git lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.5; git ${GIT_LFS_COMMIT}\\)$" && \
+    git lfs version | grep -E "^git-lfs/${GIT_LFS_VERSION} \\(GitHub; linux ${TARGETARCH}; go 1\\.26\\.6; git ${GIT_LFS_COMMIT}\\)$" && \
     test "$(command -v cloudflared)" = /usr/local/bin/cloudflared && \
     cloudflared --version | grep -F "cloudflared version ${CLOUDFLARED_VERSION}"
 
