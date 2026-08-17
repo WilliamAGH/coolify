@@ -19,6 +19,11 @@ All notable changes to this project will be documented in this file.
 - *(agents)* Gate issue filing on materiality and minimalism compliance
 - Update changelog
 - Update changelog
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.90-fork
 
 ## [4.13.89-fork] - 2026-08-13
 
