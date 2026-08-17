@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 
 - *(blue-green)* Accept final retirement fence epoch
 
+### 📚 Documentation
+
+- Update changelog
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* Prepare 4.13.91-fork
+
 ## [4.13.90-fork] - 2026-08-17
 
 ### 🐛 Bug Fixes
