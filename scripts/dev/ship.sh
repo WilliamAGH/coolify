@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Publish one immutable signed fork release from the exact staging tip.
+# Publish one immutable signed fork release from the exact main tip.
 set -Eeuo pipefail
 
-readonly RELEASE_BRANCH='staging'
+readonly RELEASE_BRANCH='main'
 readonly RELEASE_REPOSITORY='williamacallahan/coolify'
 readonly RELEASE_REMOTE='origin'
 readonly PUBLISH_WORKFLOW='publish-fork.yml'
@@ -42,8 +42,8 @@ usage:
   scripts/dev/ship.sh [--dry-run]
   scripts/dev/ship.sh status --tag X.Y.Z-fork --sha <40-hex-sha>
 
-`ship` only releases a fully committed local staging checkout whose HEAD exactly
-matches origin/staging. It derives the tag from config/constants.php and
+`ship` only releases a fully committed local main checkout whose HEAD exactly
+matches origin/main. It derives the tag from config/constants.php and
 versions.json, creates an annotated signed tag, and watches publish-fork.yml.
 USAGE
 }
@@ -226,7 +226,7 @@ load_release_tag()
   RELEASE_TAG="$constants_version"
 }
 
-require_clean_staging_checkout()
+require_clean_release_checkout()
 {
   local branch dirty
 
@@ -238,7 +238,7 @@ require_clean_staging_checkout()
   validate_sha "$SOURCE_SHA"
 }
 
-require_exact_origin_staging_tip()
+require_exact_origin_release_tip()
 {
   local origin_sha
 
@@ -435,13 +435,13 @@ ship)
   [[ "$SHIP_STATUS_DISCOVERY_DELAY_SECONDS" =~ ^[0-9]+$ ]] || \
     fail 'SHIP_STATUS_DISCOVERY_DELAY_SECONDS must be a non-negative integer'
   configure_origin
-  require_clean_staging_checkout
+  require_clean_release_checkout
   load_release_tag
   if [ "$dry_run" -eq 1 ]; then
     print_dry_run_plan
     exit 0
   fi
-  require_exact_origin_staging_tip
+  require_exact_origin_release_tip
   require_absent_release_tag
   capture_existing_exact_publish_run_ids "$RELEASE_TAG" "$SOURCE_SHA"
   create_and_verify_local_tag

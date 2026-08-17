@@ -166,13 +166,26 @@ it('publishes production only for an explicit increasing semantic version bump',
     $resolveVersion = $workflow['jobs']['resolve-version'];
     $versionStep = collect($resolveVersion['steps'])->firstWhere('id', 'version');
 
-    expect($resolveVersion['outputs']['should_publish'] ?? null)->toBe('${{ steps.version.outputs.should_publish }}')
+    expect($workflow['on']['push']['branches'])->toBe(['dev'])
+        ->and($workflow['jobs']['application-validation']['uses'] ?? null)->toBe('./.github/workflows/application-validation.yml')
+        ->and($resolveVersion['outputs']['should_publish'] ?? null)->toBe('${{ steps.version.outputs.should_publish }}')
         ->and($workflow['jobs']['publish']['if'] ?? null)->toBe("\${{ needs.resolve-version.outputs.should_publish == 'true' }}")
         ->and($applicationValidation['concurrency']['cancel-in-progress'] ?? null)->toBe("\${{ github.event_name == 'pull_request' }}")
         ->and($versionStep['env']['BEFORE_SHA'] ?? null)->toBe('${{ github.event.before }}')
         ->and($versionStep['run'] ?? '')->toContain('version_compare')
         ->toContain('should_publish=false')
         ->toContain("jq -er '.coolify.v4.version' versions.json");
+});
+
+it('keeps stable helper publication on canonical upstream main', function () {
+    $root = releaseContractRepositoryRoot();
+    $stable = Yaml::parseFile($root.'/.github/workflows/coolify-helper.yml');
+    $development = Yaml::parseFile($root.'/.github/workflows/coolify-helper-next.yml');
+
+    expect($stable['on']['push']['branches'])->toBe(['main'])
+        ->and($stable['jobs']['build-push']['if'] ?? null)->toBe("\${{ github.repository == 'coollabsio/coolify' }}")
+        ->and($stable['jobs']['merge-manifest']['if'] ?? null)->toBe("\${{ github.repository == 'coollabsio/coolify' }}")
+        ->and($development['on']['push']['branches'])->toBe(['next']);
 });
 
 it('keeps the newest version publishable after an intermediate pending bump is evicted', function () {

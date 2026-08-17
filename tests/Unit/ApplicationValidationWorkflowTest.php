@@ -595,17 +595,27 @@ function runApplicationValidationRequiredAggregate(array $environment): Process
     return $process;
 }
 
-function runApplicationValidationSourceIdentity(string $sourceSha, string $checkRunSha, string $baseSha = ''): Process
-{
+/** @param  array<string, string>  $context */
+function runApplicationValidationSourceIdentity(
+    string $sourceSha,
+    string $checkRunSha,
+    string $baseSha = '',
+    array $context = [],
+): Process {
     $step = applicationValidationSourceIdentityStep(applicationValidationWorkflow());
     $process = new Process(
         ['bash', '-c', (string) ($step['run'] ?? '')],
         dirname(__DIR__, 2),
-        [
+        array_merge([
+            'BASE_REF' => '',
             'CHECK_RUN_SHA' => $checkRunSha,
+            'EVENT_NAME' => 'workflow_call',
+            'HEAD_REF' => '',
+            'HEAD_REPOSITORY' => '',
+            'REPOSITORY' => 'williamacallahan/coolify',
             'VALIDATION_SOURCE_SHA' => $sourceSha,
             'VALIDATION_BASE_SHA' => $baseSha,
-        ],
+        ], $context),
     );
     $process->run();
 
@@ -693,17 +703,28 @@ function applicationValidationWorkflowViolations(array $workflow, ?string $blueG
     $sourceIdentity = is_array($jobs) ? ($jobs['source-identity'] ?? []) : [];
     $sourceIdentityStep = collect($sourceIdentity['steps'] ?? [])
         ->firstWhere('name', 'Bind requested source to check-run revision');
+    $sourceIdentityRun = (string) ($sourceIdentityStep['run'] ?? '');
     if (($sourceIdentity['name'] ?? null) !== 'Exact validation source identity'
         || ! is_array($sourceIdentityStep)
         || ($sourceIdentityStep['shell'] ?? null) !== 'bash'
         || ($sourceIdentityStep['env'] ?? null) !== [
+            'BASE_REF' => '${{ github.base_ref }}',
             'CHECK_RUN_SHA' => '${{ github.sha }}',
+            'EVENT_NAME' => '${{ github.event_name }}',
+            'HEAD_REF' => '${{ github.head_ref }}',
+            'HEAD_REPOSITORY' => '${{ github.event.pull_request.head.repo.full_name }}',
+            'REPOSITORY' => '${{ github.repository }}',
             'VALIDATION_SOURCE_SHA' => '${{ inputs.source_sha }}',
             'VALIDATION_BASE_SHA' => '${{ inputs.base_sha }}',
         ]
-        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '[[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]')
-        || ! str_contains((string) ($sourceIdentityStep['run'] ?? ''), '"$CHECK_RUN_SHA" == "$VALIDATION_BASE_SHA"')) {
+        || ! str_contains($sourceIdentityRun, '[[ "$VALIDATION_SOURCE_SHA" == "$CHECK_RUN_SHA" ]]')
+        || ! str_contains($sourceIdentityRun, '"$CHECK_RUN_SHA" == "$VALIDATION_BASE_SHA"')) {
         $violations[] = 'application validation must bind an exact requested source to the check-run revision';
+    }
+    if (! str_contains($sourceIdentityRun, '"$BASE_REF" == \'main\'')
+        || ! str_contains($sourceIdentityRun, '"$HEAD_REF" == \'dev\'')
+        || ! str_contains($sourceIdentityRun, '"$HEAD_REPOSITORY" == "$REPOSITORY"')) {
+        $violations[] = 'application validation must enforce same-repository dev-to-main promotion identity';
     }
     foreach (is_array($jobs) ? $jobs : [] as $jobName => $job) {
         if (in_array($jobName, ['required', 'source-identity'], true)) {
@@ -1428,6 +1449,37 @@ it('rejects a differing source when the run does not execute on the frozen base'
     expect($process->isSuccessful())->toBeFalse();
 });
 
+it('allows only same-repository dev promotions into fork main', function (array $context, bool $successful): void {
+    $process = runApplicationValidationSourceIdentity('', str_repeat('a', 40), '', $context);
+
+    expect($process->isSuccessful())->toBe($successful, $process->getErrorOutput());
+})->with([
+    'same-repository dev promotion' => [[
+        'BASE_REF' => 'main',
+        'EVENT_NAME' => 'pull_request',
+        'HEAD_REF' => 'dev',
+        'HEAD_REPOSITORY' => 'williamacallahan/coolify',
+    ], true],
+    'topic branch cannot bypass dev' => [[
+        'BASE_REF' => 'main',
+        'EVENT_NAME' => 'pull_request',
+        'HEAD_REF' => 'topic',
+        'HEAD_REPOSITORY' => 'williamacallahan/coolify',
+    ], false],
+    'external dev branch cannot promote' => [[
+        'BASE_REF' => 'main',
+        'EVENT_NAME' => 'pull_request',
+        'HEAD_REF' => 'dev',
+        'HEAD_REPOSITORY' => 'someone-else/coolify',
+    ], false],
+    'topic branches remain valid for dev' => [[
+        'BASE_REF' => 'dev',
+        'EVENT_NAME' => 'pull_request',
+        'HEAD_REF' => 'topic',
+        'HEAD_REPOSITORY' => 'williamacallahan/coolify',
+    ], true],
+]);
+
 it('rejects removing the exact validation source binding', function (): void {
     $workflow = applicationValidationWorkflow();
     $step = collect($workflow['jobs']['source-identity']['steps'] ?? [])
@@ -1437,6 +1489,21 @@ it('rejects removing the exact validation source binding', function (): void {
 
     expect(applicationValidationWorkflowViolations($workflow))
         ->toContain('application validation must bind an exact requested source to the check-run revision');
+});
+
+it('rejects removing the fork promotion identity guard', function (): void {
+    $workflow = applicationValidationWorkflow();
+    $step = collect($workflow['jobs']['source-identity']['steps'] ?? [])
+        ->search(fn (array $candidate): bool => ($candidate['name'] ?? null) === 'Bind requested source to check-run revision');
+    expect($step)->not->toBeFalse();
+    $workflow['jobs']['source-identity']['steps'][$step]['run'] = str_replace(
+        '"$HEAD_REF" == \'dev\'',
+        'true',
+        (string) $workflow['jobs']['source-identity']['steps'][$step]['run'],
+    );
+
+    expect(applicationValidationWorkflowViolations($workflow))
+        ->toContain('application validation must enforce same-repository dev-to-main promotion identity');
 });
 
 it('rejects running a validation job before exact source identity succeeds', function (): void {

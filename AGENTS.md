@@ -157,16 +157,29 @@ function loginAsRoot(): mixed
 - Use Eloquent relationships, avoid `DB::` facade — prefer `Model::query()`
 - PHP 8.5: constructor property promotion, explicit return types, type hints
 - Validation uses inline `Validator` facade in controllers/Livewire components and custom rules in `app/Rules/` — not Form Request classes
-- Run `vendor/bin/pint --dirty --format agent` before finalizing changes; finalization then commits, pushes `staging`, and watches the pushed workflow run(s) to a terminal verdict — a deploy is verified by confirming the digest-swapped instance serves the fix
+- Run `vendor/bin/pint --dirty --format agent` before finalizing changes; finalization then commits, pushes `dev`, and watches the pushed workflow run(s) to a terminal verdict — a deploy is verified by confirming the digest-swapped instance serves the fix
 - GitHub issues are filed only for material defects or features (behavior, correctness, security, performance, data quality, or a governed contract); pedantic/nitpick/style-only findings are fixed in place or dropped, never filed. Fixes and issue scope follow the minimalism bar — reuse before new code and simplify before completing, per the `ponytail` and `ce-simplify-code` skills
 - Every change must have tests — write or update tests, then run them. For bug fixes, follow TDD: write a failing test first, then fix the bug (see Test Enforcement below)
 - Check sibling files for conventions before creating new files
 
 ## Git Workflow
 
-- Integration branch: `staging`. Task work happens in a dedicated worktree branch created at task start (review/read-only tasks exempt); commits land in that worktree, and task conclusion merges the worktree commits (non-force) into the local `staging` in the primary tree and removes the worktree. Only `staging` (and release tags) are ever pushed — never push any other branch, and never open pull requests for routine work in this repo.
-- Releases ship directly from `staging`: bump `config/constants.php` + `versions.json` to `X.Y.Z-fork`, push `staging`, then push a signed `X.Y.Z-fork` tag on that commit. `publish-fork.yml` verifies staging ancestry and the allowed-signer tag signature, runs application validation from the tag, and publishes the images. Deploying = digest swap in `/data/coolify/source/docker-compose.custom.yml` on the control plane. Watch every pushed `staging`/tag workflow run to a terminal verdict; fix and re-push until green.
-- `v4.x` is the legacy default branch (ruleset-locked to PR + "Application validation"); it is no longer part of the working or release path — do not target it. `next` is upstream's development branch — untouched.
+| Branch | Role |
+|---|---|
+| `dev` | Integration branch. Task work happens in a dedicated worktree branch created at task start (review/read-only tasks exempt); task conclusion merges those commits non-force into local `dev`, removes the worktree, pushes `dev`, and watches every resulting workflow run. Routine work never opens a PR. |
+| `main` | Ruleset-protected stable/release branch. Promote a green `dev` commit through a `dev` → `main` PR whose required `Application validation` check passes; never push routine work directly. |
+| `coolify-source` | Preserved original upstream fork snapshot at `e7dff30b7c998c301fd91bd169727b90c59ec291`; never move it. |
+| `staging`, `v4.x` | Legacy fork history only; do not target them for new work or releases. |
+| `upstream/main` | Current upstream source. `next` remains upstream's development branch and is untouched. |
+
+Upstream syncs merge the remote-tracking owner into `dev`; local `main` is never used as an upstream mirror:
+
+```bash
+git fetch upstream
+git merge upstream/main   # from dev
+```
+
+- Releases ship from `main`: bump `config/constants.php` + `versions.json` to `X.Y.Z-fork` on `dev`, push and validate `dev`, promote it to `main`, then run `make ship` from a clean local `main` that exactly equals `origin/main`. `publish-fork.yml` verifies main ancestry and the allowed-signer tag signature, runs application validation from the tag, and publishes the images. Deploying = digest swap in `/data/coolify/source/docker-compose.custom.yml` on the control plane. Watch every pushed `dev`/`main`/tag workflow run to a terminal verdict; fix and re-push until green.
 - Before any commit/tag/release work, run `scripts/dev/assert-branch-current.sh` (add `--require-clean` before tagging) — it fails when local HEAD is behind origin or the tree is dirty.
 - Treat shared production infrastructure as read-only during repository work. A failing CI or release check does not authorize changes to Nexus repository policies, registry routing or authentication, Coolify service configuration, DNS, GitHub rulesets, or Actions runner groups.
 - Resolve infrastructure-policy mismatches in repository-owned workflow, code, or configuration, or report the exact blocker. Follow `docs/operations/shared-production-change-control.md` for the required boundary and recovery procedure.
