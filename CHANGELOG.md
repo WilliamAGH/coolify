@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### 🐛 Bug Fixes
 
+- *(blue-green)* Accept final retirement fence epoch
+
+## [4.13.90-fork] - 2026-08-17
+
+### 🐛 Bug Fixes
+
 - *(blue-green)* Leave every inactive-retirement row to the mature profile
 - *(blue-green)* Recover absent inactive target after reboot
 - *(images)* Patch Go stdlib vulnerabilities
@@ -17,6 +23,7 @@ All notable changes to this project will be documented in this file.
 - *(agents)* Encode worktree task lifecycle, CI watch, and completion tail
 - Update changelog
 - *(agents)* Gate issue filing on materiality and minimalism compliance
+- Update changelog
 - Update changelog
 - Update changelog
 - Update changelog
