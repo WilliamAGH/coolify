@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - *(blue-green)* Leave every inactive-retirement row to the mature profile
 - *(blue-green)* Recover absent inactive target after reboot
+- *(images)* Patch Go stdlib vulnerabilities
 
 ### 📚 Documentation
 
@@ -16,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - *(agents)* Encode worktree task lifecycle, CI watch, and completion tail
 - Update changelog
 - *(agents)* Gate issue filing on materiality and minimalism compliance
+- Update changelog
 - Update changelog
 
 ## [4.13.89-fork] - 2026-08-13
