@@ -1264,7 +1264,7 @@ KEY;
  *
  * @return array{application: Application, owner: ApplicationDeploymentQueue, state: ApplicationBlueGreenDeployment}
  */
-function makeWedgedBlueGreenInactiveRetirement(?Application $application = null): array
+function makeWedgedBlueGreenInactiveRetirement(?Application $application = null, int $finalFenceEpoch = 2): array
 {
     $application ??= makeBlueGreenInactiveRetirementApplication();
     $destination = $application->destination;
@@ -1278,7 +1278,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
         $destination,
         BlueGreenDeploymentColor::GREEN,
         2,
-        2,
+        $finalFenceEpoch,
         $ownerUuid,
     );
     $runtimeState = CompileBlueGreenProxyConfiguration::run(
@@ -1293,7 +1293,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
             ports: $application->build_pack === 'dockercompose' ? [3000, 4000] : null,
             routingRevision: 2,
             publicProofToken: BlueGreenRoutingTarget::durablePublicProofToken($ownerUuid),
-            destinationFenceEpoch: 2,
+            destinationFenceEpoch: $finalFenceEpoch,
             operationId: $ownerUuid,
             mutationSequence: 2,
             activeDeploymentUuid: $ownerUuid,
@@ -1364,7 +1364,7 @@ function makeWedgedBlueGreenInactiveRetirement(?Application $application = null)
         'inactive_retirement_container_routing_revision' => 1,
         'inactive_retirement_owner_routing_revision' => 2,
         'inactive_retirement_supersession_generation' => 2,
-        'inactive_retirement_destination_fence_epoch' => 2,
+        'inactive_retirement_destination_fence_epoch' => $runtimeState->destinationFenceEpoch,
         'inactive_retirement_server_boot_id' => '11111111-2222-3333-4444-555555555555',
         'inactive_retirement_topology_digest' => $runtimeState->destinationTopologyDigest,
         'inactive_retirement_routing_config_digest' => $runtimeState->applicationRoutingConfigDigest,
@@ -3524,7 +3524,7 @@ it('recovers a committed idle retirement with no intervention marker before a la
 });
 
 it('converges a retirement whose rehydration is fenced by its own pending drain journal', function (): void {
-    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    ['application' => $application, 'owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement(finalFenceEpoch: 3);
     prepareBlueGreenInactiveRetirementRemote($application->destination->server);
     $state->update([
         'inactive_retirement_intervention_required_at' => now(),
@@ -3611,6 +3611,22 @@ it('converges a retirement whose rehydration is fenced by its own pending drain 
     expect($claim->deploymentUuid)->toBe($successor->deployment_uuid)
         ->and($claimedState->phase)->toBe(BlueGreenDeploymentPhase::PREPARING)
         ->and($claimedState->inactive_retirement_owner_deployment_uuid)->toBeNull();
+});
+
+it('fails closed when the retirement owner claim epoch exceeds its final destination epoch', function (): void {
+    ['owner' => $owner, 'state' => $state] = makeWedgedBlueGreenInactiveRetirement();
+    $owner->update(['blue_green_destination_fence_epoch' => 3]);
+    Process::fake();
+    InspectBlueGreenContainer::shouldRun()->never();
+
+    $result = RetireBlueGreenInactiveContainer::run($state->id, $owner->deployment_uuid, 2);
+    $refreshedState = $state->fresh();
+
+    expect($result)
+        ->toBe(RetireBlueGreenInactiveContainer::INTERVENTION)
+        ->and($refreshedState->inactive_retirement_stopped_at)->toBeNull()
+        ->and($refreshedState->inactive_retirement_intervention_required_at)->not->toBeNull();
+    Process::assertNothingRan();
 });
 
 it('converges a rebooted journal-free inactive retirement with null observations before a successor deployment claims the destination', function (): void {

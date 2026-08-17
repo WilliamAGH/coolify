@@ -1642,7 +1642,9 @@ final class RetireBlueGreenInactiveContainer
             || (int) $owner->server_id !== (int) $server->id
             || $owner->pull_request_id !== 0
             || $owner->blue_green_color !== $state->active_color
-            || $owner->blue_green_destination_fence_epoch !== $state->inactive_retirement_destination_fence_epoch
+            || ! is_int($owner->blue_green_destination_fence_epoch)
+            || $owner->blue_green_destination_fence_epoch < 1
+            || $owner->blue_green_destination_fence_epoch > $state->inactive_retirement_destination_fence_epoch
             || $owner->blue_green_topology_digest !== $state->inactive_retirement_topology_digest
             || $owner->blue_green_routing_config_digest !== $state->inactive_retirement_routing_config_digest
             || (int) $inactive->application_id !== (int) $application->id
